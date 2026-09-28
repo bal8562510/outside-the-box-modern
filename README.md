@@ -138,6 +138,6 @@ The project is inspired by:
 
 **Outside the Box: Abstraction-Based Monitoring of Neural Networks**
 
-Henzinger, Lukina, Schilling.
+Authors: Henzinger, Lukina, Schilling.
 
 This repository is intended as a modern educational implementation of the core concept rather than a copy of the original research code.
