@@ -36,7 +36,6 @@ class BoxMonitor:
         representations = np.asarray(representations)
         labels = np.asarray(labels)
         classes = np.unique(labels)
-
         for class_id in classes:
             class_points = representations[labels == class_id]
             self.boxes[int(class_id)] = Box(class_points)
@@ -45,7 +44,6 @@ class BoxMonitor:
     def check(self, representation, predicted_class):
         if predicted_class not in self.boxes:
             return False
-
         box = self.boxes[predicted_class]
 
         return box.contains(representation)
