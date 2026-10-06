@@ -1,10 +1,8 @@
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import ConcatDataset, random_split
-from torchvision import datasets
-from torchvision.transforms import ToTensor
 
+from dataset import get_mnist_dataloaders
 from model import MNISTNetwork
 from monitor import BoxMonitor
 
@@ -17,28 +15,33 @@ EPOCHS = 5
 LEARNING_RATE = 0.001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Dynamic configuration settings
+CONFIG = {
+    "known_classes": [0, 1, 2, 3, 4, 5],  # Digits 0-5 are known, 6-9 are novelties
+    "train_ratio": 0.60,                  # 60% of knowns for network training
+    "monitor_ratio": 0.20,                # 20% of knowns for monitor creation
+    "seed": 42
+}
+
 print("Using device:", DEVICE)
 
 # ============================================================
 # LOAD MNIST
 # ============================================================
 
-mnist_train_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=ToTensor())
-mnist_test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=ToTensor())
-mnist_full_dataset = ConcatDataset([mnist_train_dataset, mnist_test_dataset])
-
-# Calculate split sizes (e.g., 60% model training, 20% monitor creation, 20% monitor testing)
-total_size = len(mnist_full_dataset)  # 70,000
-model_train_size = int(0.60 * total_size)    # 42,000
-monitor_creation_size = int(0.20 * total_size)  # 14,000
-monitor_test_size = total_size - model_train_size - monitor_creation_size  # 14,000
-
-# Perform the 3-way split
-model_train_set, monitor_creation_set, monitor_test_set = random_split(
-    mnist_full_dataset, 
-    [model_train_size, monitor_creation_size, monitor_test_size],
-    generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducible splits
+# Fetch the DataLoaders in one line
+model_train_set, monitor_creation_set, monitor_test_set = get_mnist_dataloaders(
+    known_classes=CONFIG["known_classes"],
+    train_ratio=CONFIG["train_ratio"],
+    monitor_ratio=CONFIG["monitor_ratio"],
+    batch_size=BATCH_SIZE,
+    seed=CONFIG["seed"]
 )
+
+# Verify the setup
+print(f"Model Training Batches   : {len(model_train_set)}")
+print(f"Monitor Creation Batches : {len(monitor_creation_set)}")
+print(f"Testing Batches          : {len(monitor_test_set)}")
 
 # ============================================================
 # CREATE MODEL
