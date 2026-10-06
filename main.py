@@ -30,7 +30,7 @@ print("Using device:", DEVICE)
 # ============================================================
 
 # Fetch the DataLoaders in one line
-model_train_set, monitor_creation_set, monitor_test_set = get_mnist_dataloaders(
+model_train_loader, monitor_creation_loader, monitor_test_loader = get_mnist_dataloaders(
     known_classes=CONFIG["known_classes"],
     train_ratio=CONFIG["train_ratio"],
     monitor_ratio=CONFIG["monitor_ratio"],
@@ -39,9 +39,9 @@ model_train_set, monitor_creation_set, monitor_test_set = get_mnist_dataloaders(
 )
 
 # Verify the setup
-print(f"Model Training Batches   : {len(model_train_set)}")
-print(f"Monitor Creation Batches : {len(monitor_creation_set)}")
-print(f"Testing Batches          : {len(monitor_test_set)}")
+print(f"Model Training Batches   : {len(model_train_loader)}")
+print(f"Monitor Creation Batches : {len(monitor_creation_loader)}")
+print(f"Testing Batches          : {len(monitor_test_loader)}")
 
 # ============================================================
 # CREATE MODEL
@@ -66,7 +66,7 @@ for epoch in range(EPOCHS):
     correct = 0
     total = 0
 
-    for images, labels in model_train_set:
+    for images, labels in model_train_loader:
         images = images.to(DEVICE)
         labels = labels.to(DEVICE)
         # Clear old gradients
@@ -129,7 +129,7 @@ all_representations = []
 all_labels = []
 
 with torch.no_grad():
-    for images, labels in monitor_creation_set:
+    for images, labels in monitor_creation_loader:
         images = images.to(DEVICE)
         outputs, hidden = model(images, return_hidden=True)
         # Move from GPU to CPU
@@ -169,7 +169,7 @@ known_correct = 0
 known_total = 0
 
 with torch.no_grad():
-    for images, labels in monitor_test_set:
+    for images, labels in monitor_test_loader:
         images = images.to(DEVICE)
         outputs, hidden = model(images, return_hidden=True)
         predictions = outputs.argmax(dim=1)
