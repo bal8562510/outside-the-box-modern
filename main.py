@@ -1,10 +1,8 @@
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import datasets
-from torchvision.transforms import ToTensor
 
+from dataset import get_mnist_dataloaders
 from model import MNISTNetwork
 from monitor import BoxMonitor
 
@@ -17,23 +15,33 @@ EPOCHS = 5
 LEARNING_RATE = 0.001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Dynamic configuration settings
+CONFIG = {
+    "known_classes": [0, 1, 2, 3, 4, 5],  # Digits 0-5 are known, 6-9 are novelties
+    "train_ratio": 0.60,                  # 60% of knowns for network training
+    "monitor_ratio": 0.20,                # 20% of knowns for monitor creation
+    "seed": 42
+}
+
 print("Using device:", DEVICE)
 
 # ============================================================
 # LOAD MNIST
 # ============================================================
 
-train_dataset = datasets.MNIST(
-    root="./data", train=True, download=True, transform=ToTensor()
+# Fetch the DataLoaders in one line
+model_train_loader, monitor_creation_loader, monitor_test_loader = get_mnist_dataloaders(
+    known_classes=CONFIG["known_classes"],
+    train_ratio=CONFIG["train_ratio"],
+    monitor_ratio=CONFIG["monitor_ratio"],
+    batch_size=BATCH_SIZE,
+    seed=CONFIG["seed"]
 )
 
-test_dataset = datasets.MNIST(
-    root="./data", train=False, download=True, transform=ToTensor()
-)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
+# Verify the setup
+print(f"Model Training Batches   : {len(model_train_loader)}")
+print(f"Monitor Creation Batches : {len(monitor_creation_loader)}")
+print(f"Testing Batches          : {len(monitor_test_loader)}")
 
 # ============================================================
 # CREATE MODEL
@@ -58,7 +66,7 @@ for epoch in range(EPOCHS):
     correct = 0
     total = 0
 
-    for images, labels in train_loader:
+    for images, labels in model_train_loader:
         images = images.to(DEVICE)
         labels = labels.to(DEVICE)
         # Clear old gradients
@@ -90,25 +98,25 @@ for epoch in range(EPOCHS):
 # NORMAL TEST ACCURACY
 # ============================================================
 
-print("\nTesting neural network...\n")
+# print("\nTesting neural network...\n")
 
-model.eval()
+# model.eval()
 
-correct = 0
-total = 0
+# correct = 0
+# total = 0
 
-with torch.no_grad():
-    for images, labels in test_loader:
-        images = images.to(DEVICE)
-        labels = labels.to(DEVICE)
-        outputs = model(images)
-        predictions = outputs.argmax(dim=1)
-        correct += (predictions == labels).sum().item()
-        total += labels.size(0)
+# with torch.no_grad():
+#     for images, labels in test_loader:
+#         images = images.to(DEVICE)
+#         labels = labels.to(DEVICE)
+#         outputs = model(images)
+#         predictions = outputs.argmax(dim=1)
+#         correct += (predictions == labels).sum().item()
+#         total += labels.size(0)
 
-test_accuracy = 100 * correct / total
+# test_accuracy = 100 * correct / total
 
-print(f"Normal MNIST test accuracy: {test_accuracy:.2f}%")
+# print(f"Normal MNIST test accuracy: {test_accuracy:.2f}%")
 
 
 # ============================================================
@@ -121,7 +129,7 @@ all_representations = []
 all_labels = []
 
 with torch.no_grad():
-    for images, labels in train_loader:
+    for images, labels in monitor_creation_loader:
         images = images.to(DEVICE)
         outputs, hidden = model(images, return_hidden=True)
         # Move from GPU to CPU
@@ -161,7 +169,7 @@ known_correct = 0
 known_total = 0
 
 with torch.no_grad():
-    for images, labels in test_loader:
+    for images, labels in monitor_test_loader:
         images = images.to(DEVICE)
         outputs, hidden = model(images, return_hidden=True)
         predictions = outputs.argmax(dim=1)
