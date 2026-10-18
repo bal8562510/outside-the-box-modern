@@ -7,3 +7,4 @@ data/
 *.pt
 *.pth
 *.pkl
+*.h5

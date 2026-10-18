@@ -3,3 +3,4 @@ torchvision
 numpy
 matplotlib
 scikit-learn
+h5py
