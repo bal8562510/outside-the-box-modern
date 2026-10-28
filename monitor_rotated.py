@@ -67,15 +67,50 @@ class RotatedBox:
         z = (np.asarray(X, dtype=np.float64) - self.mu) @ self.R
         pad = (self.high - self.low) / 2.0 * eps + self.TOL
         return np.all((z >= self.low - pad) & (z <= self.high + pad), axis=1)
-
+    
+def log_volume(box, floor=1e-6):
+        """Log of the box volume. Zero-width sides are raised to 'floor' so log() never fails."""
+        return float(np.sum(np.log(np.maximum(box.high - box.low, floor))))
 
 class LayerMonitor:
-    """One set of shapes per class for ONE layer (one shape per k-means cluster)."""
+    """One set of shapes per class for ONE layer (one shape per k-means cluster).
+
+    shape_cls can be:  Box,  RotatedBox,  "adaptive_volume",  "adaptive_validation"
+    """
+    VOL_RATIO = 0.9      # CHOICE 1: rotated must have <= 90% of the box volume
+    VAL_FRAC = 0.2       # CHOICE 2: share of a cluster held back for checking
+    MIN_POINTS = 40      # CHOICE 3: smaller clusters just use Box
+
     def __init__(self, shape_cls=Box, threshold=0.07, epsilon=0.0):
         self.shape_cls, self.threshold, self.epsilon = shape_cls, threshold, epsilon
         self.shapes = {}
 
+    def _make_shape(self, cp, rng):
+        """Build the shape for ONE cluster (cp = the points of that cluster)."""
+        if self.shape_cls == "adaptive_volume":
+            b, r = Box(cp), RotatedBox(cp)
+            if log_volume(r) <= log_volume(b) + np.log(self.VOL_RATIO):
+                return r
+            return b
+
+        if self.shape_cls == "adaptive_validation":
+            n = len(cp)
+            if n < self.MIN_POINTS:
+                return Box(cp)
+            n_val = max(1, int(self.VAL_FRAC * n))
+            perm = rng.permutation(n)
+            val, fit = cp[perm[:n_val]], cp[perm[n_val:]]
+            b, r = Box(fit), RotatedBox(fit)
+            cov_b = b.contains(val, self.epsilon).mean()
+            cov_r = r.contains(val, self.epsilon).mean()
+            if cov_r >= cov_b and log_volume(r) < log_volume(b):
+                return RotatedBox(cp)        # refit on ALL points of the cluster
+            return Box(cp)
+
+        return self.shape_cls(cp)            # Box or RotatedBox, as before
+
     def fit(self, V, y, n_classes):
+        rng = np.random.default_rng(0)       # separate rng: k-means clusters stay identical
         for c in range(n_classes):
             pts = V[y == c]
             if len(pts) == 0:
@@ -83,7 +118,7 @@ class LayerMonitor:
                 continue
             km = cluster_refinement(pts, self.threshold)
             lab = km.predict(pts)
-            self.shapes[c] = [self.shape_cls(pts[lab == j])
+            self.shapes[c] = [self._make_shape(pts[lab == j], rng)
                               for j in range(km.n_clusters) if (lab == j).any()]
         return self
 
@@ -94,7 +129,6 @@ class LayerMonitor:
             if idx.any() and shapes:
                 ok[idx] = np.any([s.contains(V[idx], self.epsilon) for s in shapes], axis=0)
         return ok
-
 
 class MultiLayerMonitor:
     """Original policy: accept only if EVERY watched layer accepts (max-confidence).
