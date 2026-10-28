@@ -3,8 +3,11 @@ import torch
 from torch import nn
 
 from dataset import get_mnist_dataloaders
-from model import MNISTNetwork
-from monitor import BoxMonitor
+from model import MNISTCNY19
+from monitor import BoxMonitor as OriginalBoxMonitor
+
+
+from rotatedbox import LayerMonitor, RotatedBox
 
 # ============================================================
 # SETTINGS
@@ -47,7 +50,7 @@ print(f"Testing Batches          : {len(monitor_test_loader)}")
 # CREATE MODEL
 # ============================================================
 
-model = MNISTNetwork()
+model = MNISTCNY19(n_classes=len(CONFIG["known_classes"]))#MNISTNetwork()
 model = model.to(DEVICE)
 loss_function = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -144,7 +147,127 @@ all_labels = np.concatenate(all_labels, axis=0)
 print("Hidden representation shape:", all_representations.shape)
 print("Example hidden vector:", all_representations[0])
 
+# ============================================================
+# COLLECT TEST REPRESENTATIONS
+# ============================================================
 
+print("\nCollecting test representations...\n")
+
+test_representations = []
+test_labels = []
+
+with torch.no_grad():
+    for images, labels in monitor_test_loader:
+        images = images.to(DEVICE)
+        outputs, hidden = model(images, return_hidden=True)
+
+        test_representations.append(hidden.cpu().numpy())
+        test_labels.append(labels.numpy())
+
+test_representations = np.concatenate(test_representations, axis=0)
+test_labels = np.concatenate(test_labels, axis=0)
+
+test_predictions = []
+
+with torch.no_grad():
+    for images, labels in monitor_test_loader:
+        images = images.to(DEVICE)
+        outputs, hidden = model(images, return_hidden=True)
+        test_predictions.append(outputs.argmax(dim=1).cpu().numpy())
+
+test_predictions = np.concatenate(test_predictions)
+
+
+
+# ============================================================
+# 1. NORMAL BOX MONITOR
+# ============================================================
+
+print("\n========== NORMAL BOX MONITOR ==========\n")
+
+normal_monitor = LayerMonitor(
+    shape_cls=Box,
+    threshold=0.07,
+    epsilon=0.0
+)
+
+normal_monitor.fit(
+    all_representations,
+    all_labels,
+    n_classes=len(CONFIG["known_classes"])
+)
+
+normal_accepted = []
+
+with torch.no_grad():
+    for images, labels in monitor_test_loader:
+        images = images.to(DEVICE)
+        outputs, hidden = model(images, return_hidden=True)
+
+        normal_accepted.extend(
+            normal_monitor.accepts(
+                hidden.cpu().numpy(),
+                outputs.argmax(dim=1).cpu().numpy()
+            )
+        )
+
+normal_accepted = np.asarray(normal_accepted, dtype=bool)
+
+print(
+    f"Normal box acceptance rate: "
+    f"{100 * normal_accepted.mean():.2f}%"
+)
+
+
+# ============================================================
+# 2. ROTATED BOX MONITOR
+# ============================================================
+
+print("\n========== ROTATED BOX MONITOR ==========\n")
+
+rotated_monitor = LayerMonitor(
+    shape_cls=RotatedBox,
+    threshold=0.07,
+    epsilon=0.0
+)
+
+rotated_monitor.fit(
+    all_representations,
+    all_labels,
+    n_classes=len(CONFIG["known_classes"])
+)
+
+rotated_accepted = []
+
+with torch.no_grad():
+    for images, labels in monitor_test_loader:
+        images = images.to(DEVICE)
+        outputs, hidden = model(images, return_hidden=True)
+
+        rotated_accepted.extend(
+            rotated_monitor.accepts(
+                hidden.cpu().numpy(),
+                outputs.argmax(dim=1).cpu().numpy()
+            )
+        )
+
+rotated_accepted = np.asarray(rotated_accepted, dtype=bool)
+
+print(
+    f"Rotated box acceptance rate: "
+    f"{100 * rotated_accepted.mean():.2f}%"
+)
+
+
+# ============================================================
+# 3. COMPARE RESULTS
+# ============================================================
+
+print("\n========== COMPARISON ==========")
+print(f"Normal boxes:  {100 * normal_accepted.mean():.2f}%")
+print(f"Rotated boxes: {100 * rotated_accepted.mean():.2f}%")
+
+"""
 # ============================================================
 # CREATE BOX MONITOR
 # ============================================================
@@ -189,3 +312,4 @@ with torch.no_grad():
 monitor_acceptance = 100 * known_correct / known_total
 
 print(f"Known test samples accepted by monitor: {monitor_acceptance:.2f}%")
+"""

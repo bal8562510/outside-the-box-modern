@@ -8,6 +8,7 @@ from torchvision import datasets
 from model import MNISTCNY19
 from monitor import MultiLayerMonitor, BooleanMonitor
 
+
 SEED, EPOCHS, BATCH = 0, 10, 128
 THRESHOLD, EPSILON = 0.07, 0.0
 LAYERS = [-1, -2, -3, -4]
