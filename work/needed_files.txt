@@ -1,0 +1,3899 @@
+﻿
+##### FILE: abstractions\SetBasedAbstraction.py #####
+
+from scipy.spatial.distance import euclidean  # NOTE: changing this requires adapting PartitionBasedAbstraction as well
+from math import inf
+
+from .Abstraction import Abstraction
+from . import PointCollection
+from utils import *
+
+EPSILON_STEP = 0.5
+
+
+class SetBasedAbstraction(Abstraction):
+    def __init__(self, confidence_fun, n, epsilon=0., epsilon_relative=True, dim=-1):
+        self.sets = [None for _ in range(n)]
+        self.dim = dim
+        self.epsilon = epsilon
+        self.epsilon_relative = epsilon_relative
+        self.confidence_fun = confidence_fun
+
+    def __str__(self):
+        return self.long_str()
+
+    def name(self):
+        return "SetBasedAbstraction"
+
+    def set_type(self):
+        raise(NotImplementedError("This method must be implemented!"))
+
+    def long_str(self):
+        return self.name() + " (" + str(len(self.sets)) + " sets, Îµ_" +\
+               ("rel" if self.epsilon_relative else "abs") + " = " + str(self.epsilon) + ")"
+
+    def initialize(self, n_watched_neurons, n_sets=None):
+        if n_sets is None:
+            n_sets = len(self.sets)
+        self.sets[:] = [self.set_type()(n_watched_neurons) for _ in range(n_sets)]
+        self.dim = n_watched_neurons
+
+    def add(self, vector):
+        for _set in self.sets:
+            if _set.isempty():
+                # TODO this is naive
+                print("Warning: using a naive 'add' method for the abstraction - better use 'add_clustered'.")
+                # found a free set; all further sets are also free
+                _set.create(vector)
+                return
+            elif _set.contains(vector, bloating=self.epsilon):
+                # vector is already contained
+                return
+        # choose a set for adding the vector to
+        _set = self.sets[self._choose_set_index(vector)]
+        # TODO allow to merge sets?
+        # if _set.isempty():
+        #     _set.create(vector)
+        # else:
+        _set.add(vector)
+
+    def isempty(self):
+        return not self.sets or self.sets[0].isempty()
+
+    def isknown_given_set_index(self, vector, set_index, skip_confidence=False, novelty_mode=False):
+        set = self.sets[set_index]
+        if not set.isempty():
+            result, confidence = set.contains(vector, self.confidence_fun, bloating=self.epsilon,
+                                              bloating_relative=self.epsilon_relative, skip_confidence=skip_confidence,
+                                              novelty_mode=novelty_mode)
+            if result:
+                return True, ACCEPTANCE_CONFIDENCE
+            else:
+                return False, confidence
+        else:
+            return False, MAXIMUM_CONFIDENCE
+
+    def isknown(self, vector, skip_confidence=False, novelty_mode=False):
+        best_result = False
+        if not self.isempty():
+            lowest_confidence = math.inf
+            for set_index in range(len(self.sets)):
+                result, confidence = self.isknown_given_set_index(vector, set_index, skip_confidence=skip_confidence,
+                                                                  novelty_mode=novelty_mode)
+                if result and not novelty_mode:
+                    lowest_confidence = ACCEPTANCE_CONFIDENCE
+                    best_result = True
+                    break
+                lowest_confidence = min(lowest_confidence, confidence)
+        else:
+            lowest_confidence = MAXIMUM_CONFIDENCE
+        return best_result, lowest_confidence
+
+    def _choose_set_index(self, vector):
+        min_distance = float('Inf')
+        min_distance_index = -1
+        for i, set_i in enumerate(self.sets):
+            if set_i.isempty():
+                continue
+            dist = euclidean(set_i.mean(), vector)
+            if dist < min_distance:
+                min_distance_index = i
+                min_distance = dist
+        return min_distance_index
+
+    def add_finalized(self, vector):
+        self.add(vector)
+
+    @staticmethod
+    def default_options():
+        n = 1
+        epsilon = 0.
+        return n, epsilon
+
+    @staticmethod
+    def coarsen_options(options):
+        n, epsilon = options
+        epsilon += EPSILON_STEP
+        return n, epsilon
+
+    @staticmethod
+    def refine_options(options):
+        n, epsilon = options
+        n += 1
+        epsilon = max(0, epsilon - EPSILON_STEP)
+        return n, epsilon
+
+    def clear(self):
+        self.sets = [self.set_type()(self.dim) for _ in self.sets]
+
+    def plot(self, dims, color, ax):
+        for _set in self.sets:
+            if _set.isempty():
+                continue
+            # plot set
+            _set.plot(dims, color, self.epsilon, self.epsilon_relative, ax)
+            # plot mean
+            if PLOT_MEAN and COMPUTE_MEAN:
+                _mean = _set.mean()
+                ax.plot(_mean[dims[0]], _mean[dims[1]], c=color, marker="+")
+
+    def add_clustered(self, values, clusterer):
+        clusters = clusterer.predict(values)
+        cluster2values = dict()
+        for vj, cj in zip(values, clusters):
+            if cj in cluster2values.keys():
+                cluster2values[cj].append(vj)
+            else:
+                cluster2values[cj] = [vj]
+        for cj, clustered_values in cluster2values.items():
+            self.add_clustered_to_set(clustered_values, cj, self.mean_computer(clusterer, cj))
+
+    def add_clustered_to_set(self, values, cj, mean_computer):
+        if len(values) == 0:
+            return
+        _set = self.sets[cj]
+        assert _set.isempty()
+        _set.create(values[0])
+        for vj in values[1:]:
+            _set.add(vj)
+
+    def update_clustering(self, clusters):
+        n_sets = cluster_number(clusters)
+        if n_sets != len(self.sets):
+            self.initialize(n_watched_neurons=self.dim, n_sets=n_sets)
+
+    def get_sets(self):
+        return self.sets
+
+    def closest_mean_dist_given_set_index(self, vector, set_index):
+        _set = self.sets[set_index]
+        if _set.isempty():
+            return inf
+        _mean = _set.mean()
+        return euclidean(_mean, vector)
+
+    def closest_mean_dist(self, vector):
+        min_distance = inf
+        for set_index in range(len(self.sets)):
+            distance = self.closest_mean_dist_given_set_index(vector, set_index)
+            min_distance = min(min_distance, distance)
+        return min_distance
+
+    def compute_credibility(self, n_total):
+        for _set in self.sets:
+            _set.compute_credibility(n_total)
+
+##### FILE: run\Runner.py #####
+
+from utils import *
+from data import *
+
+
+def run(seed, data_name, data_train_model, data_test_model, data_train_monitor, data_test_monitor, data_run,
+        model_trainer, model_name, model_path, n_epochs, batch_size, monitor_manager,
+        confidence_thresholds=None, skip_image_plotting=False, show_statistics=True):
+    if confidence_thresholds is None:
+        confidence_thresholds = [0.0]
+
+    # set random seed
+    set_random_seed(seed)
+
+    # construct statistics wrapper
+    statistics = Statistics()
+
+    # load data
+    all_classes_network, labels_network, all_classes_rest, labels_rest = get_data_loader(data_name)(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run)
+
+    print("Number of data points:", data_train_model.n, "(model training),", data_test_model.n, "(model test),",
+          data_train_monitor.n, "(monitor training),", data_test_monitor.n, "(monitor test),", data_run.n, "(run)")
+    print("Chosen classes from the original data set:", data_train_model.classes, "(model training),",
+          data_test_model.classes, "(model test),", data_train_monitor.classes, "(monitor training),",
+          data_test_monitor.classes, "(monitor test),", data_run.classes, "(run)")
+
+    # load network model or create and train it
+    model, history_model = get_model(model_name=model_name, data_train=data_train_model, data_test=data_test_model,
+                                     n_classes=len(labels_network), model_trainer=model_trainer, n_epochs=n_epochs,
+                                     batch_size=batch_size, statistics=statistics, model_path=model_path)
+
+    # plot history
+    plot_model_history(history_model)
+
+    # normalize and initialize monitors
+    monitor_manager.normalize_and_initialize(model, len(labels_rest))
+
+    # train monitors
+    monitor_manager.train(model=model, data_train=data_train_monitor, data_test=data_test_monitor,
+                          statistics=statistics)
+
+    # run monitors
+    history_run = monitor_manager.run(model=model, data=data_run, statistics=statistics)
+
+    print("\n--- session finished ---\n")
+
+    if show_statistics:
+        _show_statistics(confidence_thresholds, data_run, data_test_monitor, data_train_model, data_train_monitor,
+                         history_run, all_classes_network, labels_network, all_classes_rest, labels_rest,
+                         monitor_manager, n_epochs, skip_image_plotting, statistics)
+    else:
+        return model, history_run, all_classes_network, labels_network, all_classes_rest, labels_rest, statistics
+
+
+def _show_statistics(confidence_thresholds, data_run, data_test_monitor, data_train_model, data_train_monitor,
+                     history_run, all_classes_network, labels_network, all_classes_rest, labels_rest, monitor_manager,
+                     n_epochs, skip_image_plotting, statistics):
+    # collect novelties
+    novelty_wrapper = history_run.novelties(data_run, all_classes_network, all_classes_rest)
+    # print statistics
+    print_statistics(statistics=statistics, monitor_manager=monitor_manager,
+                     n_train_model=data_train_model.n, n_train_monitor=data_train_monitor.n,
+                     n_test_monitor=data_test_monitor.n, n_run=data_run.n, epochs=n_epochs,
+                     novelty_wrapper=novelty_wrapper, history=history_run, confidence_thresholds=confidence_thresholds)
+    # plot histograms
+    plot_histograms(monitor_manager=monitor_manager, data_train_monitor=data_train_monitor,
+                    layer2all_trained_values=None)
+    # plot monitor performance
+    plot_novelty_detection(monitors=monitor_manager.monitors(), novelty_wrapper=novelty_wrapper,
+                           confidence_thresholds=confidence_thresholds)
+    plot_false_decisions(monitors=monitor_manager.monitors(), history=history_run,
+                         confidence_thresholds=confidence_thresholds)
+    # plot projection of running data
+    known_classes = [i for i in range(len(labels_network))]
+    for monitor in monitor_manager.monitors():
+        for layer in monitor.layers():
+            plot_2d_projection(history=history_run, monitor=monitor, layer=layer, category_title="final run",
+                               known_classes=known_classes)
+    # plot warning and novelty images
+    if not skip_image_plotting:
+        for monitor in monitor_manager.monitors():
+            warn_images = history_run.warnings(monitor, data_run)
+            plot_images(images=warn_images, labels=labels_rest, classes=data_run.classes, iswarning=True,
+                        monitor_id=monitor.id())
+            novel_images = novelty_wrapper.evaluate_detection(monitor.id())
+            plot_images(images=novel_images, labels=labels_rest, classes=data_run.classes, iswarning=False,
+                        monitor_id=monitor.id())
+    print("\nDone! In order to keep the plots alive, this program does not terminate until they are closed.")
+    plt.show()
+
+##### FILE: run\run_experiment_novelty_variation.py #####
+
+from run.experiment_helper import *
+
+
+def run_experiment_novelty_variation():
+    # global options
+    seed = 0
+    alphas = [0.1, 0.01]
+    logger = Logger.start("log_novelty_variation.txt")
+
+    # instance options
+    instances = [
+        # entries: instance constructor, box_abstraction, flag for using Boolean abstraction, epsilon,
+        # clustering threshold, class count
+        (instance_MNIST, box_abstraction_MNIST, True, 0.0, 0.07, -1),
+        (instance_F_MNIST, box_abstraction_F_MNIST, True, 0.0, 0.07, -1),
+        (instance_CIFAR10, box_abstraction_CIFAR10, False, 0.0, 0.07, -1),
+        (instance_GTSRB, box_abstraction_GTSRB, False, 0.1, 0.3, 20)
+    ]
+
+    for instance_function, box_abstraction, use_boolean_abstraction, epsilon, clustering_threshold, n_classes_max in \
+            instances:
+        model_name, data_name, stored_network_name, total_classes = instance_function()
+        if use_boolean_abstraction:
+            storage_monitors = [[], [], []]
+        else:
+            storage_monitors = [[], []]
+        storage_at = [[] for _ in alphas]
+        if n_classes_max == -1:
+            n_classes_max = total_classes
+        else:
+            n_classes_max += 1
+        for n_classes in range(2, n_classes_max):
+            print("\n--- new instance ---\n")
+            # load instance
+            data_train_model, data_test_model, data_train_monitor, data_test_monitor, data_run, model_path, _ = \
+                load_instance(n_classes, total_classes, stored_network_name)
+
+            # create (fresh) monitors
+            monitor1 = box_abstraction()
+            monitor2 = box_abstraction(learn_from_test_data=True)
+            monitors = [monitor1, monitor2]
+            if use_boolean_abstraction:
+                layer2abstraction = {-2: BooleanAbstraction()}
+                monitor3 = Monitor(layer2abstraction=layer2abstraction)
+                monitors.append(monitor3)
+            monitor_manager = MonitorManager(monitors, clustering_threshold=clustering_threshold)
+
+            # run instance
+            history_run, histories_alpha_thresholding, novelty_wrapper_run, novelty_wrappers_alpha_thresholding, \
+                statistics = evaluate_all(seed=seed, data_name=data_name, data_train_model=data_train_model,
+                                          data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+                                          data_test_monitor=data_test_monitor, data_run=data_run, model_name=model_name,
+                                          model_path=model_path, monitor_manager=monitor_manager, alphas=alphas)
+
+            # print/store statistics
+            print_general_statistics(statistics, data_train_monitor, data_run)
+            print_and_store_monitor_statistics(storage_monitors, monitors, statistics, history_run,
+                                               novelty_wrapper_run, data_train_monitor, data_run)
+
+            # store statistics for alpha thresholding
+            for i, (history_alpha, novelty_wrapper_alpha, alpha) in enumerate(zip(
+                    histories_alpha_thresholding, novelty_wrappers_alpha_thresholding, alphas)):
+                history_alpha.update_statistics(0, confidence_threshold=alpha)
+                fn = history_alpha.false_negatives()
+                fp = history_alpha.false_positives()
+                tp = history_alpha.true_positives()
+                tn = history_alpha.true_negatives()
+                novelty_results = novelty_wrapper_alpha.evaluate_detection(0, confidence_threshold=alpha)
+                storage = CoreStatistics(fn=fn, fp=fp, tp=tp, tn=tn,
+                                         novelties_detected=len(novelty_results["detected"]),
+                                         novelties_undetected=len(novelty_results["undetected"]))
+                storage_at[i].append(storage)
+
+        # store results
+        filename_prefix = "novelty_" + data_name
+        store_core_statistics(storage_monitors[0], "monitor1", filename_prefix=filename_prefix)
+        store_core_statistics(storage_monitors[1], "monitor2", filename_prefix=filename_prefix)
+        if use_boolean_abstraction:
+            store_core_statistics(storage_monitors[2], "monitor3", filename_prefix=filename_prefix)
+        store_core_statistics(storage_at, alphas, filename_prefix=filename_prefix)
+
+    # close log
+    logger.stop()
+
+
+def plot_experiment_novelty_variation():
+    # global options
+    alphas = [0.1, 0.01]
+
+    # instance options
+    instances = [
+        ("MNIST", True, 8, None),
+        ("F_MNIST", True, 8, None),
+        ("CIFAR10", False, 8, None),
+        ("GTSRB", False, 19, 19)
+    ]
+
+    for data_name, use_boolean_abstraction, n_ticks, n_bars in instances:
+        filename_prefix = "novelty_" + data_name
+        storage_all = load_core_statistics(alphas, filename_prefix=filename_prefix)
+        if use_boolean_abstraction:
+            storage_all.append(load_core_statistics("monitor3", filename_prefix=filename_prefix))
+        storage_all.append(load_core_statistics("monitor1", filename_prefix=filename_prefix))
+        storage_all.append(load_core_statistics("monitor2", filename_prefix=filename_prefix))
+
+        plot_false_decisions_given_all_lists(storage_all, n_ticks=n_ticks, name=filename_prefix, n_bars=n_bars)
+
+    save_all_figures(close=True)
+
+
+def run_experiment_novelty_variation_all():
+    run_experiment_novelty_variation()
+    plot_experiment_novelty_variation()
+
+
+if __name__ == "__main__":
+    run_experiment_novelty_variation_all()
+
+##### FILE: C:\work\original\utils\Anomaly.py #####
+
+class Anomaly(object):
+    WARNING = 0
+    DETECTED = 1
+    UNDETECTED = 2
+
+    def __init__(self, input, c_ground_truth, c_predicted, status):
+        self.original_input = input
+        self.c_ground_truth = c_ground_truth
+        self.c_predicted = c_predicted
+        self.status = status
+
+##### FILE: C:\work\original\utils\barPlot.py #####
+
+# libraries
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import rc
+import pandas as pd
+
+# y-axis in bold
+rc('font', weight='bold')
+
+# Values of each group
+bars1 = [12, 28, 1]  # detected
+bars2 = [28, 7, 16]
+
+# Heights of bars1 + bars2
+bars = np.add(bars1, bars2).tolist()
+
+# The position of the bars on the x-axis
+r = [0, 1, 2]
+
+# Names of group and bar width
+names = ['MNIST', 'CIFAR', 'GTSRB']
+barWidth = 1
+
+# Create blue bars
+plt.bar(r, bars1, color='#7f6d5f', edgecolor='white', width=barWidth)
+# Create red bars, on top of the firs ones
+plt.bar(r, bars2, bottom=bars1, color='#557f2d', edgecolor='white', width=barWidth)
+
+# Custom X axis
+plt.xticks(r, names, fontweight='bold')
+plt.xlabel("group")
+
+# Show graphic
+plt.show()
+
+##### FILE: C:\work\original\utils\Clustering.py #####
+
+from sklearn.cluster import KMeans
+from sklearn.cluster import MeanShift
+
+from utils import *
+
+
+# --- public --- #
+
+
+def cluster_refinement(class2values, algorithm, threshold=None, n_clusters=None):
+    class2clusters = dict()
+    for class_index, values in class2values.items():
+        clusters = _cluster_refinement_class(values, algorithm=algorithm, threshold=threshold, n_clusters=n_clusters)
+        print(" class", class_index, "will use", cluster_number(clusters), "clusters")
+        class2clusters[class_index] = clusters
+    return class2clusters
+
+
+def cluster_number(clusterer):
+    if isinstance(clusterer, KMeans):
+        return clusterer.n_clusters
+    elif isinstance(clusterer, MeanShift):
+        return clusterer.cluster_centers_.shape[0]
+
+
+def cluster_center(clusterer, cluster):
+    return clusterer.cluster_centers_[cluster]
+
+
+# --- private --- #
+
+
+def _cluster_refinement_class(values, algorithm, threshold, n_clusters):
+    if algorithm == "KMeans":
+        return _cluster_refinement_class_kmeans(values, threshold, n_clusters)
+    elif algorithm == "MeanShift":
+        return _cluster_refinement_class_meanshift(values)
+    else:
+        raise(ValueError("Unknown algorithm: " + str(threshold)))
+
+
+def _cluster_refinement_class_kmeans(values, threshold, n_clusters):
+    if n_clusters is not None:
+        return _cluster(values, n_clusters)
+
+    n_clusters = 1
+    n_values = len(values)
+    assert n_values > 0
+    clustered = _cluster(values, n_clusters)
+    inertias = [clustered.inertia_]
+    while n_values > n_clusters:
+        n_clusters_new = n_clusters + 1
+        clustered_new = _cluster(values, n_clusters_new)
+        inertias.append(clustered_new.inertia_)
+
+        if _terminate_clustering(inertias, threshold):
+            break
+        clustered = clustered_new
+        n_clusters += 1
+    return clustered
+
+
+def _cluster_refinement_class_meanshift(values):
+    clustered = MeanShift().fit(values)
+    return clustered
+
+
+def _cluster(values, n_clusters):
+    clustered = KMeans(n_clusters).fit(values)
+    # print("Number of clusters:", n_clusters, ", inertia:", clustered.inertia_)
+    return clustered
+
+
+def _terminate_clustering(inertias, threshold):
+    # policy: compute relative improvement toward previous step
+    assert len(inertias) > 1
+    improvement = 1 - (inertias[-1] / inertias[-2])
+    return improvement < threshold
+
+##### FILE: C:\work\original\utils\CombinedHistory.py #####
+
+from utils import *
+
+
+class CombinedHistory(History):
+    def __init__(self, histories: list):
+        super().__init__()
+        for history in histories[1:]:
+            assert histories[0].ground_truths == history.ground_truths and \
+                   histories[0].predictions == history.predictions, "The histories are incompatible."
+        self.set_ground_truths(histories[0].ground_truths)
+        self.set_predictions(histories[0].predictions)
+        self.monitor2results = self._merge_results(histories)
+
+    def _merge_results(self, histories):
+        results_new = [MonitorResult() for _ in range(len(self.ground_truths))]
+        for history in histories:
+            for results in history.monitor2results.values():
+                for result_new, result_old in zip(results_new, results):  # Type: MonitorResult, MonitorResult
+                    for confidence in result_old._confidences:
+                        result_new.add_confidence(confidence)
+        return {0: results_new}
+
+##### FILE: C:\work\original\utils\ConditionalHistory.py #####
+
+from utils import *
+
+
+class ConditionalHistory(History):
+    def __init__(self, histories_guard: list, histories_body: list, confidence_guard: float):
+        super().__init__()
+        assert histories_guard and histories_body, "ConditionalHistory needs two nonempty lists."
+        for history in histories_guard[1:] + histories_body:
+            assert histories_guard[0].ground_truths == history.ground_truths and \
+                   histories_guard[0].predictions == history.predictions, "The histories are incompatible."
+        self.set_ground_truths(histories_guard[0].ground_truths)
+        self.set_predictions(histories_guard[0].predictions)
+        self.monitor2results = None
+        self.monitor2results_guard = CombinedHistory(histories_guard).monitor2results
+        self.monitor2results_body = CombinedHistory(histories_body).monitor2results
+        self.confidence_guard = confidence_guard
+
+    def update_statistics(self, monitor_id, confidence_threshold=0.0, n_min_acceptance=None):
+        results_guard = self.monitor2results_guard[monitor_id]
+        results_body = self.monitor2results_body[monitor_id]
+        true_negatives = 0
+        false_positives = 0
+        false_negatives = 0
+        true_positives = 0
+        zero_filtered = 0
+        for j, (c_ground_truth, c_prediction, result_guard, result_body) in \
+                enumerate(zip(self.ground_truths, self.predictions, results_guard, results_body)):
+            guard_accepts = result_guard.accepts(self.confidence_guard, n_min_acceptance)
+            if guard_accepts:
+                accepts = True
+            else:
+                accepts = result_body.accepts(confidence_threshold, n_min_acceptance)
+                if not accepts and result_guard.is_zero_filtered() and result_body.is_zero_filtered():
+                    zero_filtered += 1
+            is_correct = c_prediction == c_ground_truth
+            if is_correct:
+                if accepts:
+                    true_negatives += 1
+                else:
+                    false_positives += 1
+            else:
+                if accepts:
+                    false_negatives += 1
+                else:
+                    true_positives += 1
+        self._tn = true_negatives
+        self._tp = true_positives
+        self._fn = false_negatives
+        self._fp = false_positives
+        self._zero_filtered = zero_filtered
+
+    def novelties(self, data: DataSpec, classes_network, classes_rest):
+        nw = super().novelties(data, classes_network, classes_rest)
+        return ConditionalNoveltyWrapper(nw.novelties, nw.novelty_indices, nw.ground_truths, nw.predictions,
+                                         self.monitor2results_guard, self.monitor2results_body, self.confidence_guard)
+
+##### FILE: C:\work\original\utils\ConditionalNoveltyWrapper.py #####
+
+from utils import *
+
+
+class ConditionalNoveltyWrapper(NoveltyWrapper):
+    def __init__(self, novelties, novelty_indices, ground_truths, predictions, monitor2results_guard,
+                 monitor2results_body, confidence_guard: float):
+        super().__init__(novelties, novelty_indices, ground_truths, predictions, None)
+        self.monitor2results_guard = monitor2results_guard
+        self.monitor2results_body = monitor2results_body
+        self.confidence_guard = confidence_guard
+
+    def evaluate_detection(self, monitor_id, confidence_threshold=0.0, n_min_acceptance=None):
+        detected = []
+        undetected = []
+        results_guard = self.monitor2results_guard[monitor_id]
+        results_body = self.monitor2results_body[monitor_id]
+        for i, image, gt, p in zip(self.novelty_indices, self.novelties, self.ground_truths, self.predictions):
+            result_guard = results_guard[i]  # Type: MonitorResult
+            result_body = results_body[i]  # Type: MonitorResult
+            guard_accepts = result_guard.accepts(self.confidence_guard, n_min_acceptance)
+            if guard_accepts:
+                accepts = True
+            else:
+                accepts = result_body.accepts(confidence_threshold, n_min_acceptance)
+            if accepts:
+                novelty = Anomaly(input=image, c_ground_truth=gt, c_predicted=p, status=Anomaly.UNDETECTED)
+                undetected.append(novelty)
+            else:
+                novelty = Anomaly(input=image, c_ground_truth=gt, c_predicted=p, status=Anomaly.DETECTED)
+                detected.append(novelty)
+
+        return {"detected": detected, "undetected": undetected}
+
+##### FILE: C:\work\original\utils\Confidence.py #####
+
+def euclidean_distance(set, point, *args):
+    return set.euclidean_distance(point, *args)
+
+
+def halfspace_distance(set, point, *args):
+    return set.halfspace_distance(point, *args)
+
+##### FILE: C:\work\original\utils\CoreStatistics.py #####
+
+class CoreStatistics(object):
+    def __init__(self, tn, fn, tp, fp, novelties_detected, novelties_undetected, time_training=-1, time_running=-1):
+        self.tn = tn
+        self.fn = fn
+        self.tp = tp
+        self.fp = fp
+        self.novelties_detected = novelties_detected
+        self.novelties_undetected = novelties_undetected
+        self.time_training = time_training
+        self.time_running = time_running
+
+    @staticmethod
+    def row_header():
+        return ["tn", "fn", "tp", "fp", "nov_det", "nov_undet", "t_train", "t_run"]
+
+    def as_row(self):
+        return [self.tn, self.fn, self.tp, self.fp, self.novelties_detected, self.novelties_undetected,
+                self.time_training, self.time_running]
+
+    def get_n(self):
+        return self.tn + self.fn + self.tp + self.fp
+
+    @staticmethod
+    def parse(row):
+        assert len(row) == 8, "Illegal input of length {} received.".format(len(row))
+        row_converted = [int(e) for e in row[0:6]] + [float(e) for e in row[6:8]]
+        return CoreStatistics(*row_converted)
+
+##### FILE: C:\work\original\utils\DataSpec.py #####
+
+from . import *
+
+
+class DataSpec(object):
+    def __init__(self, file=None, n=None, randomize=False, classes=None, x=None, y=None):
+        self.file = file
+        self.n = n
+        self.randomize = randomize
+        self.classes = classes
+        self._x = x
+        self._y = y
+
+    def x(self):
+        return self._x
+
+    def y(self):
+        return self._y
+
+    def ground_truths(self):
+        return categoricals2numbers(self._y)
+
+    def set_data(self, data=None, x=None, y=None):
+        if data is not None:
+            # extract data from dict
+            self.set_x(data["features"])
+            self.set_y(data["labels"])
+        else:
+            self.set_x(x)
+            self.set_y(y)
+
+    def set_x(self, x):
+        self._x = x
+
+    def set_y(self, y):
+        self._y = y
+
+    def has_data(self):
+        return self._x is not None and self._y is not None
+
+    def filter(self, filter):
+        self._x = self._x[filter]
+        self._y = self._y[filter]
+        self.n = len(self._y)
+
+##### FILE: C:\work\original\utils\Helpers.py #####
+
+from math import sqrt
+from time import time
+from datetime import time as time_type
+import numpy as np
+import colorsys
+import random
+from copy import copy
+import csv
+from tensorflow_core.python.keras.models import Model
+from tensorflow_core.python.data import Dataset
+
+from .CoreStatistics import CoreStatistics
+
+
+def to_classes(list_of_bit_vectors):
+    return [to_class(b) for b in list_of_bit_vectors]
+
+
+def to_class(bit_vector):
+    return np.where(bit_vector == 1)[0][0]
+
+
+def to_dataset(x_train, y_train, batch_size):
+    return Dataset.from_tensor_slices((x_train, y_train)).batch(batch_size)
+
+
+def ratio(part, total):
+    try:
+        return part / total * 100
+    except ZeroDivisionError:
+        return 100.0
+    except TypeError:
+        return "?"
+
+
+def extend(strings):
+    n = max(len(s) for s in strings)
+    return (s.rjust(n) for s in strings)
+
+
+def get_rgb_colors(n):
+    if n == 2:
+        # special options for binary case
+        return [(0.33, 0.42, 0.2), (0.96, 0.52, 0.26)]  # orange/green
+        # return [(1., 0., 0.), (0, .4, .6)]  # red/blue
+
+    # based on https://stackoverflow.com/a/876872
+    hsv_tuples = [(x * 1.0 / n, 0.8, 1) for x in range(n)]
+    rgb_colors = [colorsys.hsv_to_rgb(*x) for x in hsv_tuples]
+    rgb_colors_shuffled = []
+    step = int(sqrt(n))
+    i = 0
+    while i < step:
+        for j in range(step):
+            rgb_colors_shuffled.append(rgb_colors[i + j * step])
+        i += 1
+    rgb_colors_shuffled.extend(rgb_colors[i+(step-1)*step:])
+    return rgb_colors_shuffled
+
+
+def get_markers(n_classes):
+    all_markers = ["o", "s", "^", "*", "p", "X", "D", "2", ".", "<", ">", "v"]
+    if n_classes > len(all_markers):
+        markers = copy(all_markers)
+        while n_classes > len(markers):
+            markers.extend(markers)
+    else:
+        markers = all_markers
+    return markers[:n_classes]
+
+
+def set_random_seed(n):
+    print("Setting random seed to", n)
+    random.seed(n)
+    np.random.seed(n)
+
+
+def get_image_shape(images):
+    return images.shape[1:4]
+
+
+def categoricals2numbers(categorical_vectors):
+    """convert categorical vectors to numbers"""
+    return [categorical2number(categorical_vector) for categorical_vector in categorical_vectors]
+
+
+def categorical2number(categorical_vector):
+    """convert categorical vector to number"""
+    return np.where(categorical_vector == 1)[0][0]
+
+
+def number_of_classes(classes):
+    m = max(classes) + 1
+    l = len(classes)
+    return max(m, l)
+
+
+def number_of_model_classes(model):
+    return model.layers[-1].output_shape[1]
+
+
+def rate_fraction(num, den):
+    if den == 0:
+        return 0  # convention: return 0
+    return num/den
+
+
+def obtain_predictions(model, data, layers=None, ignore_misclassifications: bool = False):
+    delta_t = time()
+    if layers is None:
+        values = model.predict(data.x())
+        result = to_classifications(values)
+    else:
+        if ignore_misclassifications:
+            # compare classes to ground truths
+            classes, _ = obtain_predictions(model, data)
+            filter = []
+            for i, (p, gt) in enumerate(zip(classes, data.ground_truths())):
+                if p == gt:
+                    filter.append(i)
+            data.filter(filter)
+        layer2values = dict()
+        for layer_index in layers:
+            try:
+                manual_model = model.is_manual_model()
+            except:
+                manual_model = False
+            if manual_model:
+                result = model.predict(data.x(), layer_index)
+            else:
+                # construct pruned model following
+                # https://keras.io/getting-started/faq/#how-can-i-obtain-the-output-of-an-intermediate-layer
+                model_until_layer = Model(inputs=model.input, outputs=model.layers[layer_index].output)
+                result = model_until_layer.predict(data.x())
+            layer2values[layer_index] = result
+        result = layer2values
+    timer = time() - delta_t
+
+    return result, timer
+
+
+def to_classifications(list_of_predictions):
+    return [to_classification(p) for p in list_of_predictions]
+
+
+def to_classification(prediction):
+    return np.argmax(prediction)
+
+
+def filter_labels(all_labels, all_classes):
+    if len(all_classes) < len(all_labels):
+        return [all_labels[i] for i in range(max(all_classes) + 1)]
+    else:
+        return all_labels
+
+
+def normalize_layer(model, raw_layer):
+    layer_index = None
+    if isinstance(raw_layer, str):
+        # search for layer in the model
+        for idx, layer in enumerate(model.layers):
+            if layer.name == raw_layer:
+                layer_index = idx
+                break
+    elif isinstance(raw_layer, int):
+        if raw_layer < 0:
+            layer_index = len(model.layers) + raw_layer
+            assert layer_index >= 0, "Negative layer indices should be such that their absolute value is smaller " + \
+                                     "than the number of layers."
+        else:
+            layer_index = raw_layer
+            assert layer_index < len(model.layers), "Layer index exceeds the number of layers."
+    else:
+        raise (ValueError("A layer needs to be a string or an integer, but got ", raw_layer))
+
+    if layer_index is None:
+        raise (ValueError("Could not find layer", raw_layer))
+
+    return layer_index
+
+
+def float_printer(timer):
+    if isinstance(timer, time_type):
+        f = timer.second + timer.microsecond / 1000000
+    else:
+        assert isinstance(timer, int) or isinstance(timer, float)
+        f = timer
+    if f < 1e-2:
+        if f == 0:
+            return "0.00"
+        return "< 0.01"
+    return "{:.2f}".format(f)
+
+
+def uniform_bins(n: int, max=1.0):
+    step = max / float(n)
+    return [i * step for i in range(n + 1)]
+
+
+def determine_zero_filters(values: dict, data, n_neurons, layer=None):
+    class2nonzeros = dict()
+    for class_id in data.classes:
+        class2nonzeros[class_id] = [0 for _ in range(n_neurons)]
+    for vj, gt in zip(values, data.ground_truths()):
+        for i, vi in enumerate(vj):
+            if vi > 0:
+                class2nonzeros[gt][i] += 1
+    # create mask of all dimensions with entry 'True' whenever there is at least one non-zero entry
+    class2nonzero_mask = dict()
+    for class_id, nonzeros in class2nonzeros.items():
+        nonzero_mask = []
+        n_zeros = 0
+        for i, nzi in enumerate(nonzeros):
+            if nzi > 0:
+                nonzero_mask.append(True)
+            else:
+                nonzero_mask.append(False)
+                n_zeros += 1
+        class2nonzero_mask[class_id] = nonzero_mask
+        if layer is not None:
+            print("filtering zeros removes {:d}/{:d} dimensions from layer {:d} for class {:d}".format(
+                n_zeros, n_neurons, layer, class_id))
+    return class2nonzero_mask
+
+
+def classes2string(classes):
+    if classes == [k for k in range(len(classes))]:
+        # short version for consecutive classes
+        return "0-{:d}".format(len(classes) - 1)
+    else:
+        # long version with enumeration of all classes
+        comma = ""
+        string = ""
+        for c in classes:
+            string += comma + str(c)
+            comma = ","
+    return string
+
+
+def store_core_statistics(storages, name, filename_prefix="results"):
+    if isinstance(name, str):
+        filename = "{}-{}.csv".format(filename_prefix, name)
+        _store_core_statistics_helper(filename, storages)
+    else:
+        assert isinstance(name, list)
+        for storages_alpha, alpha in zip(storages, name):
+            filename = "{}-at{}.csv".format(filename_prefix, int(alpha * 100))
+            _store_core_statistics_helper(filename, storages_alpha)
+
+
+def _store_core_statistics_helper(filename, storages):
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(CoreStatistics.row_header())
+        for storage in storages:
+            writer.writerow(storage.as_row())
+
+
+def load_core_statistics(name, filename_prefix="results"):
+    if isinstance(name, str):
+        filename = "{}-{}.csv".format(filename_prefix, name)
+        storages = _load_core_statistics_helper(filename)
+        return storages
+    else:
+        assert isinstance(name, list)
+        storages_all = []
+        for alpha in name:
+            filename = "{}-at{}.csv".format(filename_prefix, int(alpha * 100))
+            storages = _load_core_statistics_helper(filename)
+            storages_all.append(storages)
+        return storages_all
+
+
+def _load_core_statistics_helper(filename):
+    storages = []
+    with open(filename) as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        for row in reader:
+            cs = CoreStatistics.parse(row)
+            storages.append(cs)
+    return storages
+
+
+def number_of_hidden_layers(model):
+    return len(model.layers) - 2
+
+
+def number_of_hidden_neurons(model):
+    n = 0
+    for layer_idx in range(1, len(model.layers) - 1):
+        layer = model.layers[layer_idx]
+        prod = 1
+        for j in range(1, len(layer.output_shape)):
+            prod *= layer.output_shape[j]
+        n += prod
+    return n
+
+##### FILE: C:\work\original\utils\History.py #####
+
+from utils import *
+
+
+class History(object):
+    def __init__(self):
+        self.ground_truths = []
+        self.predictions = []
+        self.monitor2results = dict()
+        self.layer2values = dict()
+        self._tn = 0
+        self._tp = 0
+        self._fn = 0
+        self._fp = 0
+        self._zero_filtered = 0
+
+    def set_ground_truths(self, ground_truths):
+        self.ground_truths = ground_truths
+
+    def set_layer2values(self, layer2values):
+        self.layer2values = layer2values
+
+    def set_predictions(self, predictions):
+        self.predictions = predictions
+
+    def set_monitor_results(self, m_id, results):
+        self.monitor2results[m_id] = results
+
+    def classification_statistics(self):
+        correct_classifications = 0
+        for j, (c_ground_truth, c_prediction) in enumerate(zip(self.ground_truths, self.predictions)):
+            if c_prediction == c_ground_truth:
+                correct_classifications += 1
+        incorrect_classifications = len(self.ground_truths) - correct_classifications
+        return correct_classifications, incorrect_classifications
+
+    def true_negatives(self):
+        return self._tn
+
+    def true_positives(self):
+        return self._tp
+
+    def false_negatives(self):
+        return self._fn
+
+    def false_positives(self):
+        return self._fp
+
+    def zero_filtered(self):
+        return self._zero_filtered
+
+    def true_positive_rate(self):
+        tp = self.true_positives()
+        fn = self.false_negatives()
+        return rate_fraction(tp, tp + fn)
+
+    def true_negative_rate(self):
+        tn = self.true_negatives()
+        fp = self.false_positives()
+        return rate_fraction(tn, tn + fp)
+
+    def false_positive_rate(self):
+        fp = self.false_positives()
+        tn = self.true_negatives()
+        return rate_fraction(fp, fp + tn)
+
+    def false_negative_rate(self):
+        fn = self.false_negatives()
+        tp = self.true_positives()
+        return rate_fraction(fn, fn + tp)
+
+    def positive_predictive_value(self):
+        tp = self.true_positives()
+        fp = self.false_positives()
+        return rate_fraction(tp, tp + fp)
+
+    def negative_predictive_value(self):
+        tn = self.true_negatives()
+        fn = self.false_negatives()
+        return rate_fraction(tn, tn + fn)
+
+    # alias
+    def precision(self):
+        return self.positive_predictive_value()
+
+    # alias
+    def recall(self):
+        return self.true_positive_rate()
+
+    # F1 score = harmonic mean between precision and recall, see https://en.wikipedia.org/wiki/F1_score
+    def f1_score(self):
+        p = self.precision()
+        r = self.recall()
+        return rate_fraction(2. * (p * r), p + r)
+
+    def average_score(self):
+        p = self.precision()
+        r = self.recall()
+        return (p + r) / 2
+
+    def warnings(self, monitor, data, confidence_threshold=0.0):
+        warning_list = []
+        for i, (image, gt, p, res) in enumerate(zip(data.x(), self.ground_truths, self.predictions,
+                                                    self.monitor2results[monitor.id()])):
+            if not res.accepts(confidence_threshold):
+                warning = Anomaly(input=image, c_ground_truth=gt, c_predicted=p, status=Anomaly.WARNING)
+                warning_list.append(warning)
+        return warning_list
+
+    def novelties(self, data: DataSpec, classes_network, classes_rest):
+        # collect new labels
+        anomaly_labels = []
+        for class_id in classes_rest:
+            if class_id not in classes_network:
+                anomaly_labels.append(class_id)
+
+        # identify anomalies
+        novelties = []
+        novelty_indices = []
+        ground_truths = []
+        predictions = []
+        for i, (image, gt, p) in enumerate(zip(data.x(), self.ground_truths, self.predictions)):
+            if gt in anomaly_labels:
+                novelties.append(image)
+                novelty_indices.append(i)
+                ground_truths.append(gt)
+                predictions.append(p)
+
+        return NoveltyWrapper(novelties, novelty_indices, ground_truths, predictions, self.monitor2results)
+
+    def update_statistics(self, monitor_id, confidence_threshold=0.0, n_min_acceptance=None):
+        results = self.monitor2results[monitor_id]
+        true_negatives = 0
+        false_positives = 0
+        false_negatives = 0
+        true_positives = 0
+        zero_filtered = 0
+        for j, (c_ground_truth, c_prediction, result) in enumerate(zip(self.ground_truths, self.predictions, results)):
+            if result.is_zero_filtered():
+                zero_filtered += 1
+            accepts = result.accepts(confidence_threshold, n_min_acceptance)
+            is_correct = c_prediction == c_ground_truth
+            if is_correct:
+                if accepts:
+                    true_negatives += 1
+                else:
+                    false_positives += 1
+            else:
+                if accepts:
+                    false_negatives += 1
+                else:
+                    true_positives += 1
+        self._tn = true_negatives
+        self._tp = true_positives
+        self._fn = false_negatives
+        self._fp = false_positives
+        self._zero_filtered = zero_filtered
+
+##### FILE: C:\work\original\utils\LoadData.py #####
+
+from pickle import load
+from random import sample
+import numpy as np
+from tensorflow.keras.utils import to_categorical
+
+from utils import *
+
+
+def load_data(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+              data_test_monitor: DataSpec, data_run: DataSpec,
+              pixel_depth=None):
+    data_specs = [data_train_model, data_test_model, data_train_monitor, data_test_monitor, data_run]
+    data_specs_network = [data_train_model, data_test_model]
+    data_specs_rest = [data_train_monitor, data_test_monitor, data_run]
+
+    # load data from files and pickle it
+    for ds in data_specs:
+        if not ds.has_data():
+            if ds.file is None:
+                raise(ValueError("Got a DataSpec with neither data nor a file name specified!"))
+
+            file = "../" + ds.file  # go up one folder because run scripts are started from the folder "run/"
+            with open(file, mode='rb') as f:
+                data = load(f)
+                ds.set_data(data=data)
+            assert ds.has_data(), "Was not able to find data!"
+
+    # filter data such that only the specified classes occur
+    for ds in data_specs:
+        if ds.classes is not None:
+            x_new = []
+            y_new = []
+            for x, y in zip(ds.x(), ds.y()):
+                if y in ds.classes:
+                    x_new.append(x)
+                    y_new.append(y)
+            ds.set_data(x=np.array(x_new), y=np.array(y_new))
+
+    # account for the correct number of data points
+    for ds in data_specs:
+        length = len(ds.y())
+        if ds.n is None or ds.n > length:
+            ds.n = length
+        elif ds.n < length:
+            if ds.randomize:
+                # sample uniformly from the whole data
+                indices = sample(range(length), ds.n)
+                x = ds.x()[indices]
+                y = ds.y()[indices]
+            else:
+                # choose the first n data points
+                x = ds.x()[:ds.n]
+                y = ds.y()[:ds.n]
+            ds.set_data(x=x, y=y)
+
+    # normalize data by pixel depth
+    if pixel_depth is not None:
+        for ds in data_specs:
+            x = (ds.x().astype(np.float32) - (pixel_depth * 0.5)) / (pixel_depth * 0.5)
+            ds.set_data(x=x, y=ds.y())
+
+    # normalize labels to "categorical vector"
+    all_classes_network = get_labels(data_specs_network)
+    all_classes_rest = get_labels(data_specs_rest)
+
+    return all_classes_network, all_classes_rest
+
+
+def get_labels(data_specs):
+    all_classes_total = set()
+
+    for ds in data_specs:
+        all_classes_data = set()
+        if len(ds.y().shape) == 1:
+            # collect all classes
+            for yi in ds.y():
+                all_classes_data.add(yi)
+        else:
+            # collect all classes
+            for yi in ds.y():
+                all_classes_data.add(np.argmax(yi))
+
+        if len(ds.y().shape) == 1:
+            # normalize labels to "categorical vector"
+            ds.set_y(to_categorical(ds.y(), num_classes=number_of_classes(all_classes_data), dtype='float32'))
+        for cd in all_classes_data:
+            all_classes_total.add(cd)
+
+    return sorted(all_classes_total)
+
+##### FILE: C:\work\original\utils\Logger.py #####
+
+import sys
+
+
+# taken from https://stackoverflow.com/a/11325249
+class Logger(object):
+    def __init__(self, *files):
+        self.files = files
+
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+    @staticmethod
+    def start(file):
+        f = open(file, "w")
+        logger = Logger(sys.stdout, f)
+        sys.stdout = logger
+        return logger
+
+    def stop(self):
+        sys.stdout = self.files[0]
+        self.files[1].close()
+
+##### FILE: C:\work\original\utils\ModelCreator.py #####
+
+from os.path import isfile
+from tensorflow_core.python.keras.models import load_model as tf_load_model
+from time import time
+
+from utils import *
+from models.ModelLoader import get_model_loader
+
+
+def get_model(model_name: str, data_train: DataSpec, data_test: DataSpec, n_classes, model_trainer, n_epochs,
+              batch_size, statistics: Statistics, model_path):
+    model_path, model_constructor = get_model_loader(model_name, model_path)
+
+    model_path = "../" + model_path  # go up one folder because run scripts are started from the folder "run/"
+    loaded = False
+    if isfile(model_path):
+        try:
+            model, history = load_model(model_path)
+            loaded = True
+        except:
+            pass
+
+    if not loaded:
+        print("Could not load model", model_path, "- creating and training new model")
+        image_shape = get_image_shape(data_train.x())
+
+        # construct raw model
+        model = model_constructor(weights=None, classes=n_classes, input_shape=image_shape)
+
+        # train model
+        time_training_model = time()
+        history = model_trainer.train(model, data_train, data_test, epochs=n_epochs, batch_size=batch_size)
+        statistics.time_training_model = time() - time_training_model
+
+        # store model
+        store_model(model_path, model, history)
+
+    return model, history
+
+
+def load_model(model_path):
+    model = tf_load_model(model_path)
+    print("Loaded model from", model_path)
+    history = None  # TODO store/load history?
+    return model, history
+
+
+def store_model(model_path, model, history):
+    print("Storing model to", model_path)
+    model.save(model_path)
+    # TODO store/load history?
+
+##### FILE: C:\work\original\utils\MonitorResult.py #####
+
+from utils import *
+
+
+class MonitorResult(object):
+    def __init__(self):
+        self._confidences = []
+        self._is_zero_filtered = False
+
+    def __str__(self):
+        if self.is_zero_filtered():
+            result = "rejecting due to zero-dimension-pattern mismatch"
+        else:
+            result = "rejecting with confidence {:f}".format(self.confidence())
+        return "{:d} abstractions considered (â†’ {})".format(len(self._confidences), result)
+
+    def add_confidence(self, confidence: float):
+        self._confidences.append(confidence)
+
+    def accepts(self, confidence_threshold, n_min_acceptance=None):
+        if self.is_zero_filtered():
+            return False
+        elif n_min_acceptance is None:
+            return self.confidence() <= confidence_threshold
+        else:
+            n_accepting = 0
+            for confidence in self._confidences:
+                if confidence <= confidence_threshold:
+                    n_accepting += 1
+            if n_min_acceptance > 0:
+                return n_accepting >= n_min_acceptance
+            else:
+                n_total = len(self._confidences)
+                n_rejecting = n_total - n_accepting
+                return n_rejecting < -n_min_acceptance
+
+    def confidence(self):
+        if self.is_zero_filtered():
+            return MAXIMUM_CONFIDENCE
+        if COMPOSITE_ABSTRACTION_POLICY == 1:
+            # average
+            return sum(self._confidences) / float(len(self._confidences))
+        elif COMPOSITE_ABSTRACTION_POLICY == 2:
+            # maximum
+            return max(self._confidences)
+        else:
+            raise NotImplementedError("Policy {} is not available.".format(COMPOSITE_ABSTRACTION_POLICY))
+
+    def set_zero_filter(self):
+        self._is_zero_filtered = True
+
+    def is_zero_filtered(self):
+        return self._is_zero_filtered
+
+##### FILE: C:\work\original\utils\NoveltyWrapper.py #####
+
+from utils import *
+
+
+class NoveltyWrapper(object):
+    def __init__(self, novelties, novelty_indices, ground_truths, predictions, monitor2results):
+        self.novelties = novelties
+        self.novelty_indices = novelty_indices
+        self.ground_truths = ground_truths
+        self.predictions = predictions
+        self.monitor2results = monitor2results
+
+    def evaluate_detection(self, monitor_id, confidence_threshold=0.0, n_min_acceptance=None):
+        detected = []
+        undetected = []
+        results = self.monitor2results[monitor_id]
+        for i, image, gt, p in zip(self.novelty_indices, self.novelties, self.ground_truths, self.predictions):
+            res = results[i]  # Type: MonitorResult
+            if res.accepts(confidence_threshold, n_min_acceptance):
+                novelty = Anomaly(input=image, c_ground_truth=gt, c_predicted=p, status=Anomaly.UNDETECTED)
+                undetected.append(novelty)
+            else:
+                novelty = Anomaly(input=image, c_ground_truth=gt, c_predicted=p, status=Anomaly.DETECTED)
+                detected.append(novelty)
+
+        return {"detected": detected, "undetected": undetected}
+
+##### FILE: C:\work\original\utils\Options.py #####
+
+import matplotlib.pyplot as plt
+
+# verbosity
+VERBOSE_MODEL_TRAINING = False  # print debug output of training the model
+N_PRINT_WARNINGS = 49  # number of monitor warnings printed
+N_PRINT_NOVELTIES = 49  # number of monitor novelties printed
+PRINT_CONVEX_HULL_SAVED_VERTICES = False  # print number of vertices saved by convex hulls
+PRINT_CREDIBILITY = True  # print credibility of abstractions
+
+# plotting
+N_HISTOGRAM_PLOTS_UPPER_BOUND = 0  # maximum number of histogram plots
+PLOT_MEAN = False  # plot mean of abstractions? (requires COMPUTE_MEAN == True)
+PLOT_NON_EPSILON_SETS = False  # plot inner sets if epsilon is used?
+_PLOT_MONITOR_TRAINING_AXIS = None
+_PLOT_MONITOR_RATES_AXIS = None
+PLOT_MONITOR_PERFORMANCE = True  # plot monitor performance (pie charts)?
+
+
+def PLOT_MONITOR_TRAINING_AXIS():  # plot window for monitor training
+    global _PLOT_MONITOR_TRAINING_AXIS
+    if _PLOT_MONITOR_TRAINING_AXIS is None:
+        _PLOT_MONITOR_TRAINING_AXIS = plt.figure().add_subplot()
+    return _PLOT_MONITOR_TRAINING_AXIS
+
+
+def PLOT_MONITOR_RATES_AXIS():
+    global _PLOT_MONITOR_RATES_AXIS
+    if _PLOT_MONITOR_RATES_AXIS is None:
+        _PLOT_MONITOR_RATES_AXIS = plt.subplots(1, 3)
+    return _PLOT_MONITOR_RATES_AXIS
+
+
+# general
+FILTER_ZERO_DIMENSIONS = False  # filter out dimensions that were zero in the monitor training?
+
+
+# monitor-training related
+COMPUTE_MEAN = False  # compute the mean of 'SetBasedAbstraction's?
+CONVEX_HULL_REDUNDANCY_REMOVAL = False  # remove redundant vertices from convex hulls?
+CONVEX_HULL_REMOVE_BATCHES = False  # remove several points at once in the convex hulls? (almost no practical effect)
+ONLY_LEARN_FROM_CORRECT_CLASSIFICATIONS = True  # ignore misclassification samples during monitor training?
+MONITOR_TRAINING_CONVERGENCE_RANGE = 0.001  # range that is considered "no change" during monitor training
+MONITOR_TRAINING_WINDOW_SIZE = 5  # convergence window (= number of data points in which no change occurs) during
+#                                   monitor training
+PRINT_FLAT_CONVEX_HULL_WARNING = True  # print warning about flat convex hulls
+
+
+def print_flat_convex_hull_warning():
+    global PRINT_FLAT_CONVEX_HULL_WARNING
+    if PRINT_FLAT_CONVEX_HULL_WARNING:
+        PRINT_FLAT_CONVEX_HULL_WARNING = False
+        print("Warning: Convex hull is flat, for which conversion to H-representation is not available.")
+
+
+# monitor-running related
+PROPOSE_CLASS = False  # let the monitor propose a class based on the mean? (requires COMPUTE_MEAN == True)
+MAXIMUM_CONFIDENCE = 1.0  # maximum confidence for rejection
+ACCEPTANCE_CONFIDENCE = 0.0  # confidence when accepting
+INCREDIBLE_CONFIDENCE = 1.0  # confidence when rejecting due to incredibility
+SKIPPED_CONFIDENCE_NOVELTY_MODE = -1.0  # confidence when training novelties (has no meaning)
+SKIPPED_CONFIDENCE = 1.0  # confidence when no distance is used
+CONVEX_HULL_HALF_SPACE_DISTANCE_CORNER_CASE = 0.0  # half-space confidence for flat convex hulls
+COMPOSITE_ABSTRACTION_POLICY = 2  # policy for CompositeAbstraction and multi-layer monitors; possible values:
+#                                   1: average
+#                                   2: maximum
+
+
+# --- defaults --- #
+
+
+# data-loading related
+N_TRAIN = 2000  # number of training data points
+N_TEST = 1000  # number of testing data points
+N_RUN = 1000  # number of running data points
+RANDOMIZE_DATA = False  # randomize the data after loading?
+CLASSES = [0, 1]  # classes for filtering (empty list: any)
+# network related
+N_EPOCHS = 10  # number of training epochs
+BATCH_SIZE = 128  # batch size
+# utilities
+DEFAULT_SEED = 0  # default random seed
+
+##### FILE: C:\work\original\utils\Partitioning.py #####
+
+def uniform_partition(n, block_size):
+    m = n // block_size
+    r = n % block_size
+    partition = [block_size for _ in range(m)]
+    if r > 0:
+        partition.append(r)
+    return partition
+
+##### FILE: C:\work\original\utils\Plotting.py #####
+
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+# import pandas as pd
+# import seaborn as sns
+
+
+from . import *
+
+
+def initialize_subplots(n_subplots, title):
+    n_cols = math.ceil(math.sqrt(n_subplots))
+    n_rows = math.ceil(n_subplots / n_cols)
+    fig, ax = plt.subplots(nrows=n_rows, ncols=n_cols, squeeze=False)
+    row = 0
+    col = -1
+    fig.canvas.set_window_title(title)
+    fig.suptitle(title)
+    return fig, ax, n_cols, row, col
+
+
+def initialize_single_plot(title):
+    fig, ax = plt.subplots()
+    fig.canvas.set_window_title(title)
+    return fig, ax
+
+
+def plot_histograms(monitor_manager, data_train_monitor: DataSpec, layer2all_trained_values):
+    if layer2all_trained_values is None:
+        return
+
+    y = data_train_monitor.y()
+    n_plots = 0
+    for class_index, box_family in enumerate(monitor_manager.monitors[0].abstraction.abstractions):
+        if n_plots >= N_HISTOGRAM_PLOTS_UPPER_BOUND:
+            if n_plots == 0:
+                print("Skipping histogram plots as requested in the options!".format(N_HISTOGRAM_PLOTS_UPPER_BOUND))
+            else:
+                print("Skipping the remaining histogram plots!".format(N_HISTOGRAM_PLOTS_UPPER_BOUND))
+            break
+        boxes = box_family.boxes
+        for box in boxes:
+            if box.isempty():
+                continue
+            if n_plots >= N_HISTOGRAM_PLOTS_UPPER_BOUND:
+                break
+            n_plots += 1
+            for layer_index, all_trained_values in layer2all_trained_values.items():
+                # plot 1D-histograms of trained values and compare them with the boxes
+                fig, ax, n_cols, row, col = initialize_subplots(len(all_trained_values[0]), "Histograms")
+                for dim in range(len(all_trained_values[0])):
+                    if col < n_cols - 1:
+                        col += 1
+                    else:
+                        row += 1
+                        col = 0
+                    dimension = []
+                    for ind, trained_value in enumerate(all_trained_values):
+                        if categorical2number(y[ind]) == class_index:
+                            dimension.append(trained_value[dim])
+                    ax[row][col].hist(dimension, color='steelblue',
+                                      bins=int(np.sqrt(len(all_trained_values[0]))),
+                                      edgecolor='black', linewidth=1)
+                    ax[row][col].plot([box.low[dim], box.high[dim]], [1, 1], color='red', linewidth=5)
+                plt.draw()
+                plt.pause(0.0001)
+
+
+def plot_model_history(history):
+    if history is None:
+        return
+
+    loss_list = [s for s in history.history.keys() if 'loss' in s and 'val' not in s]
+    val_loss_list = [s for s in history.history.keys() if 'loss' in s and 'val' in s]
+    acc_list = [s for s in history.history.keys() if 'acc' in s and 'val' not in s]
+    val_acc_list = [s for s in history.history.keys() if 'acc' in s and 'val' in s]
+
+    # As loss always exists
+    epochs = range(1, len(history.history[loss_list[0]]) + 1)
+
+    # Loss
+    fig, ax, _, _, _ = initialize_subplots(2, "History")
+    ax = ax[0]
+    for l in loss_list:
+        ax[0].plot(epochs, history.history[l],
+                   label='Training loss (' + str(str(format(history.history[l][-1], '.5f')) + ')'))
+    for l in val_loss_list:
+        ax[0].plot(epochs, history.history[l], 'g',
+                   label='Validation loss (' + str(str(format(history.history[l][-1], '.5f')) + ')'))
+
+    ax[0].set_title('Loss')
+    ax[0].set_xlabel('Epochs')
+    ax[0].set_ylabel('Loss')
+    ax[0].legend()
+
+    # Accuracy
+    for l in acc_list:
+        ax[1].plot(epochs, history.history[l],
+                   label='Training accuracy (' + str(format(history.history[l][-1], '.5f')) + ')')
+    for l in val_acc_list:
+        ax[1].plot(epochs, history.history[l], 'g',
+                   label='Validation accuracy (' + str(format(history.history[l][-1], '.5f')) + ')')
+
+    ax[1].set_title('Accuracy')
+    ax[1].set_xlabel('Epochs')
+    ax[1].set_ylabel('Accuracy')
+    ax[1].legend()
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_images(images, labels, classes, iswarning: bool, monitor_id: int):
+    if iswarning:
+        n = len(images)
+        if n > N_PRINT_WARNINGS:
+            print("printing only the first {:d} out of {:d} warnings for monitor {:d}".format(
+                N_PRINT_WARNINGS, n, monitor_id))
+            n = N_PRINT_WARNINGS
+        title_list = ["Warnings of monitor {:d}".format(monitor_id)]
+        images_list = [images]
+        n_list = [n]
+    else:
+        title_list = ["Novelties detected by monitor {:d}".format(monitor_id),
+                      "Novelties not detected by monitor {:d}".format(monitor_id)]
+        images_list = [images["detected"], images["undetected"]]
+        n_list = []
+        for images in images_list:
+            n = len(images)
+            if n > N_PRINT_NOVELTIES:
+                print("printing only the first {:d} out of {:d} novelties for monitor {:d}".format(
+                    N_PRINT_NOVELTIES, n, monitor_id))
+                n = N_PRINT_NOVELTIES
+            n_list.append(n)
+
+    plotted_once = False
+    for title, images, n in zip(title_list, images_list, n_list):
+        if n == 0:
+            continue
+        plotted_once = True
+        colors = get_rgb_colors(max(classes) + 1)
+        fig, ax, n_cols, row, col = initialize_subplots(n, title)
+
+        for i, image in enumerate(images):
+            if iswarning and i >= N_PRINT_WARNINGS:
+                break
+            if not iswarning and i >= N_PRINT_NOVELTIES:
+                break
+
+            if col < n_cols - 1:
+                col += 1
+            else:
+                row += 1
+                col = 0
+            ax[row][col].axis('off')
+            normalized_image = np.clip(image.original_input, 0, 1)
+            if len(normalized_image.shape) > 2 and normalized_image.shape[2] == 1:
+                normalized_image = normalized_image.reshape((28, 28))
+            ax[row][col].imshow(normalized_image)
+
+            # add ground-truth class
+            ax[row][col].scatter(-10, -5, color=colors[image.c_ground_truth])
+            ax[row][col].annotate(labels[image.c_ground_truth] + " (GT)", (-8, -5))
+            # add predicted class
+            ax[row][col].scatter(-10, -10, color=colors[image.c_predicted])
+            ax[row][col].annotate(labels[image.c_predicted] + " (NN)", (-8, -10))
+
+    if plotted_once:
+        plt.draw()
+        plt.pause(0.0001)
+
+
+def plot_monitor_training(monitor, history, iterations, scores, best_scores, fp_list, fn_list, tp_list,
+                          class2inertias, score_name, category_title):
+    ax = PLOT_MONITOR_TRAINING_AXIS()
+    ax.cla()
+    for layer in monitor.layers():
+        plot_2d_projection(history=history, monitor=monitor, layer=layer, category_title=category_title, ax=ax)
+
+    fig, ax = PLOT_MONITOR_RATES_AXIS()
+    fig.canvas.set_window_title("Monitor-training history")
+
+    # plot rates & score
+    ax[0].cla()
+    ax[0].scatter(iterations, fp_list, marker='^', c="r")
+    ax[0].plot(iterations, fp_list, label="false positive rate", c="r", linestyle=":")
+    ax[0].scatter(iterations, fn_list, marker='x', c="b")
+    ax[0].plot(iterations, fn_list, label="false negative rate", c="b", linestyle="--")
+    ax[0].plot(iterations, scores, label=score_name, c="g")
+    ax[0].plot(iterations, best_scores, label="best score", c="orange")
+    ax[0].set_title('False rates & score of the monitor')
+    ax[0].set_xlabel('Iteration')
+    ax[0].set_ylabel('Rates/Score')
+    ax[0].legend()
+
+    # adding another y axis does not work correctly
+    # ax2 = ax[0].twinx()
+    # ax2.cla()
+    # ax2.plot(iterations, n_boxes_list, c="y", linestyle="--")
+    # ax2.set_ylabel("# boxes", c="y")
+    # ax2.legend()
+
+    # plot ROC curve
+    ax[1].cla()
+    ax[1].scatter(fp_list, tp_list, marker='^', c="r")
+    ax[1].plot([0, 1], [0, 1], label="baseline", c="k", linestyle=":")
+    ax[1].set_title('ROC curve')
+    ax[1].set_xlabel('False positive rate')
+    ax[1].set_ylabel('True positive rate')
+    ax[1].legend()
+
+    # plot clustering inertias
+    ax[2].cla()
+    for class_index, inertias in class2inertias.items():
+        ax[2].plot(iterations, inertias, label="clustering inertia class {}".format(class_index), linestyle=":")
+    ax[2].set_title('Clustering inertias')
+    ax[2].set_xlabel('Iteration')
+    ax[2].set_ylabel('Inertia')
+    ax[2].legend()
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_2d_projection(history, monitor, layer, category_title, ax=None, known_classes=None, novelty_marker="$N$",
+                       dimensions=None):
+    if ax is None:
+        ax = plt.figure().add_subplot()
+    m_id = 0 if monitor is None else monitor.id()
+    title = "Projected data & abstractions ({}) (monitor {:d}, layer {:d})".format(category_title, m_id, layer)
+    ax.figure.suptitle(title)
+    ax.figure.canvas.set_window_title(title)
+    if dimensions is None:
+        dimensions = monitor.dimensions(layer)
+    x = dimensions[0]
+    y = dimensions[1]
+    ax.set_xlabel("x{:d}".format(x), size=16)
+    ax.set_ylabel("x{:d}".format(y), size=16)
+    for tick in ax.xaxis.get_major_ticks():
+        tick.label.set_fontsize(16)
+    for tick in ax.yaxis.get_major_ticks():
+        tick.label.set_fontsize(16)
+
+    # create mapping 'class -> values'
+    class2values = dict()
+    for cj, vj in zip(history.ground_truths, history.layer2values[layer]):
+        if cj in class2values.keys():
+            xs, ys = class2values[cj]
+        else:
+            xs = []
+            ys = []
+            class2values[cj] = (xs, ys)
+        xs.append(vj[x])
+        ys.append(vj[y])
+
+    if known_classes is None:
+        n_classes = max(class2values.keys()) + 1
+    else:
+        n_classes = len(known_classes)
+    colors = get_rgb_colors(n_classes)
+    markers = get_markers(n_classes)
+
+    # plot abstraction
+    if monitor is not None:
+        for i, ai in enumerate(monitor.abstraction(layer).abstractions()):
+            if ai.isempty():
+                continue
+            ai.plot(dims=dimensions, ax=ax, color=colors[i])
+
+    # scatter plot
+    novelties = []
+    for cj, (xs, ys) in class2values.items():
+        if known_classes is None or cj in known_classes:
+            color = [colors[cj]]
+            marker = markers[cj]
+        else:
+            novelties.append((xs, ys))
+            continue
+        ax.scatter(xs, ys, alpha=0.5, label="c" + str(cj), c=color, marker=marker)
+    # plot novelties last
+    for xs, ys in novelties:
+        ax.scatter(xs, ys, alpha=1.0, label="novelty", c=["k"], marker=novelty_marker, zorder=3)
+
+    # ax.legend()
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_zero_point(ax, color, epsilon, epsilon_relative):
+    if epsilon > 0 and not epsilon_relative:
+        print("Epsilon with zero filtering is ignored in plotting.")
+    ax.scatter([0], [0], alpha=1.0, c=[color], marker="$+$")
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_interval(ax, p1, p2, color, epsilon, epsilon_relative, is_x_dim):
+    if epsilon > 0:
+        print("Epsilon with zero filtering is ignored in plotting.")
+    if is_x_dim:
+        points = [[p1, 0], [p2, 0]]
+    else:
+        points = [[0, p1], [0, p2]]
+    polygon = Polygon(points, closed=True, linewidth=1, edgecolor=color, facecolor="none")
+    ax.add_patch(polygon)
+
+
+def plot_pie_chart_single(ax, tp, tn, fp, fn, n_run):
+    # pie chart, where the slices will be ordered and plotted counter-clockwise
+    if n_run >= 0:
+        sizes = [ratio(tn, n_run), ratio(tp, n_run), ratio(fp, n_run), ratio(fn, n_run)]
+    else:
+        sizes = [1, 1, 1, 1]
+
+    colors = ["w", "w", "w", "w"]
+    wedges, texts, autotexts = ax.pie(sizes, autopct='%1.1f%%', startangle=0, colors=colors,
+                                      wedgeprops={"edgecolor": [0, .4, .6]},
+                                      pctdistance=1.2, labeldistance=1.5)
+    plt.setp(autotexts, size=16)
+    patterns = [".", "o", "*", "O"]
+    for i in range(len(wedges)):
+        wedges[i].set_hatch(patterns[i % len(patterns)])
+        if i in [2, 3]:
+            wedges[i].set_ec([1, 0, 0])
+
+    """nicer labels but they don't work well"
+    bbox_props = dict(boxstyle="square,pad=0.3", fc="w", ec="k", lw=0.72)
+    kw = dict(arrowprops=dict(arrowstyle="-"),
+              bbox=bbox_props, zorder=0, va="center")
+
+    for i, p in enumerate(wedges):
+        ang = (p.theta2 - p.theta1) / 2. + p.theta1
+        y = np.sin(np.deg2rad(ang))
+        x = np.cos(np.deg2rad(ang))
+        horizontalalignment = {-1: "right", 1: "left"}[int(np.sign(x))]
+        connectionstyle = "angle,angleA=0,angleB={}".format(ang)
+        kw["arrowprops"].update({"connectionstyle": connectionstyle})
+        ax.annotate(sizes[i], xy=(x, y), xytext=(1.35*np.sign(x), 1.4*y),
+                    horizontalalignment=horizontalalignment, **kw)
+    """
+
+    ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+
+    if n_run < 0:
+        # plot only the legend
+        ax.cla()
+        plt.axis('off')
+        labels = 'true negatives', 'true positives', 'false positives', 'false negatives'
+        ax.legend(wedges, labels, loc="center", handleheight=3)
+
+
+def _get_binary_pie(t):
+    n = t[0] + t[1]
+    return [ratio(t[0], n), ratio(t[1], n)]
+
+
+def plot_novelty_detection(monitors, novelty_wrapper, confidence_thresholds, n_min_acceptance=None, name=None):
+    x, xticks = get_xticks_bars(confidence_thresholds)
+
+    if name is None and n_min_acceptance is not None:
+        if n_min_acceptance >= 0:
+            name = "acceptance {:d}".format(n_min_acceptance)
+        else:
+            name = "rejection {:d}".format(-n_min_acceptance)
+    for monitor in monitors:
+        m_id = monitor if isinstance(monitor, int) else monitor.id()
+        y = []
+        for confidence_threshold in confidence_thresholds:
+            novelties = novelty_wrapper.evaluate_detection(m_id, confidence_threshold,
+                                                           n_min_acceptance=n_min_acceptance)
+            n = len(novelties["detected"])
+            d = n + len(novelties["undetected"])
+            y.append(ratio(n, d))
+
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        ax.bar(x, y, color=[0, .4, .6], edgecolor='white', width=0.5)
+        ax.set_xlabel("Confidence threshold")
+        ax.set_ylabel("Novelties detected [%]")
+        ax.set_ylim([0, 100])
+        ax.xaxis.set_ticks(xticks)
+        if name is None:
+            final_name = "{:d}".format(m_id)
+        else:
+            final_name = name
+        title = "Novelty detection (monitor {})".format(final_name)
+        fig.suptitle(title)
+        ax.figure.canvas.set_window_title(title)
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_novelty_detection_given_all_lists(core_statistics_list_of_lists: list, n_ticks, name=""):
+    n_monitors = len(core_statistics_list_of_lists)
+    n_bars = len(core_statistics_list_of_lists[0])
+    for core_statistics_list in core_statistics_list_of_lists:
+        assert len(core_statistics_list) == n_bars, "Incompatible list lengths found!"
+    # x = [i for i in range(2, len(core_statistics_list) + 2)]
+    # xticks = x
+    x, xticks = get_xticks_bars([i for i in range(2, len(core_statistics_list_of_lists[0]) + 2)], n=n_ticks, to_float=False)
+    fig = plt.figure()
+    ax = fig.add_subplot()
+    width = 1.0 / float(n_monitors + 1)
+    for b in range(n_bars):
+        for i, core_statistics_list in enumerate(core_statistics_list_of_lists):
+            cs = core_statistics_list[b]
+            d = cs.novelties_detected + cs.novelties_undetected
+            nd = ratio(cs.novelties_detected, d)
+            nu = ratio(cs.novelties_undetected, d)
+            x_adapted = x[b] + i * width
+            ax.bar(x_adapted, nd, color=[0, .4, .6], edgecolor='white', width=width)
+            sums = nd
+            ax.bar(x_adapted, nu, bottom=sums, color=[1, 0.6, 0.2], edgecolor='white', width=width)
+    ax.set_ylim([0, 100])
+    ax.xaxis.set_ticks(xticks)
+    title = "Novelty detection {}".format(name)
+    fig.suptitle(title)
+    ax.figure.canvas.set_window_title(title)
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+# 'monitors' can either be a list of numbers or a list of Monitor objects
+def plot_false_decisions(monitors, history: History, confidence_thresholds, n_min_acceptance=None, name=None,
+                         title=None):
+    d = len(history.ground_truths)
+    x, xticks = get_xticks_bars(confidence_thresholds)
+
+    if name is None and n_min_acceptance is not None:
+        if n_min_acceptance >= 0:
+            name = "acceptance {:d}".format(n_min_acceptance)
+        else:
+            name = "rejection {:d}".format(-n_min_acceptance)
+    for monitor in monitors:
+        m_id = monitor if isinstance(monitor, int) else monitor.id()
+        if name is None:
+            final_name = "{:d}".format(m_id)
+        else:
+            final_name = name
+        y_fn = []
+        y_fp = []
+        y_tp = []
+        y_tn = []
+        for confidence_threshold in confidence_thresholds:
+            history.update_statistics(m_id, confidence_threshold=confidence_threshold,
+                                      n_min_acceptance=n_min_acceptance)
+            fn = history.false_negatives()
+            fp = history.false_positives()
+            tp = history.true_positives()
+            tn = history.true_negatives()
+            y_fn.append(ratio(fn, d))
+            y_fp.append(ratio(fp, d))
+            y_tp.append(ratio(tp, d))
+            y_tn.append(ratio(tn, d))
+
+        _plot_false_decisions_helper(x, xticks, y_fn, y_fp, y_tp, final_name, title=title)
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def _plot_false_decisions_helper(x, xticks, y_fn, y_fp, y_tp, name, name2="", title=None):
+    fig = plt.figure()
+    ax = fig.add_subplot()
+    width = 0.5
+    blue = [0, .4, .6]
+    yellow = [1, 0.65, 0.25]
+    red = [1, 0, 0]
+    ax.bar(x, y_tp, color=blue, edgecolor="white", width=width)
+    sums = y_tp
+    ax.bar(x, y_fn, bottom=sums, color=yellow, edgecolor="white", hatch="x", width=width)
+    sums = [_x + _y for _x, _y in zip(sums, y_fn)]
+    ax.bar(x, y_fp, bottom=sums, color=red, edgecolor='white', hatch=".", width=width)
+    # sums = [_x + _y for _x, _y in zip(sums, y_tp)]
+    # ax.bar(x, y_tn, bottom=sums, color=[0, 0.9, 0.1], edgecolor='white', width=width)
+    ax.set_xlabel("Confidence threshold")
+    ax.set_ylabel("True positives [blue] / false negatives [orange] / false positives [red]")
+    ax.set_ylim([0, 100])
+    ax.xaxis.set_ticks(xticks)
+    if title is None:
+        title = "Decision performance (monitor {}) {}".format(name, name2)
+    fig.suptitle(title)
+    ax.figure.canvas.set_window_title(title)
+
+
+def plot_false_decisions_given_list(core_statistics_list: list, n_ticks, name="", name2=""):
+    d = core_statistics_list[0].get_n()
+    # x = [i for i in range(2, len(core_statistics_list) + 2)]
+    # xticks = x
+    x, xticks = get_xticks_bars([i for i in range(2, len(core_statistics_list) + 2)], n=n_ticks, to_float=False)
+    y_fn = []
+    y_fp = []
+    y_tp = []
+    y_tn = []
+    for cs in core_statistics_list:
+        y_fn.append(ratio(cs.fn, d))
+        y_fp.append(ratio(cs.fp, d))
+        y_tp.append(ratio(cs.tp, d))
+        y_tn.append(ratio(cs.tn, d))
+
+    _plot_false_decisions_helper(x, xticks, y_fn, y_fp, y_tp, name=name, name2=name2)
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_false_decisions_given_all_lists(core_statistics_list_of_lists: list, n_ticks, n_bars=None, name=""):
+    n_monitors = len(core_statistics_list_of_lists)
+    n_bars_reference = len(core_statistics_list_of_lists[0])
+    if n_bars is None:
+        n_bars = n_bars_reference
+
+    for core_statistics_list in core_statistics_list_of_lists:
+        assert len(core_statistics_list) == n_bars_reference, "Incompatible list lengths found!"
+    # x = [i for i in range(2, len(core_statistics_list) + 2)]
+    # xticks = x
+    x, xticks = get_xticks_bars([i for i in range(2, n_bars + 2)], n=n_ticks, to_float=False)
+    fig = plt.figure()
+    ax = fig.add_subplot()
+    width = 1.0 / float(n_monitors + 1)
+    blue = [0, .4, .6]
+    yellow = [1, 0.65, 0.25]
+    red = [1, 0, 0]
+    for b in range(n_bars):
+        for i, core_statistics_list in enumerate(core_statistics_list_of_lists):
+            cs = core_statistics_list[b]
+            d = cs.get_n()
+            y_fn = ratio(cs.fn, d)
+            y_fp = ratio(cs.fp, d)
+            y_tp = ratio(cs.tp, d)
+            y_tn = ratio(cs.tn, d)
+            x_adapted = x[b] + i * width
+            ax.bar(x_adapted, y_tp, color=blue, edgecolor="white", width=width)
+            sums = y_tp
+            ax.bar(x_adapted, y_fn, bottom=sums, color=yellow, edgecolor="white", hatch="x", width=width)
+            sums += y_fn
+            ax.bar(x_adapted, y_fp, bottom=sums, color=red, edgecolor='white', hatch=".", width=width)
+            # sums = [_x + _y for _x, _y in zip(sums, y_tp)]
+            # ax.bar(x_adapted, y_tn, bottom=sums, color=[0, 0.9, 0.1], edgecolor='white', width=width)
+    ax.set_ylim([0, 100])
+    ax.xaxis.set_ticks(xticks)
+    title = "Decision performance {}".format(name)
+    fig.suptitle(title)
+    ax.figure.canvas.set_window_title(title)
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+def plot_false_decisions_legend():
+    fig = plt.figure()
+    ax = fig.add_subplot()
+    title = "Legend"
+    ax.figure.suptitle(title)
+    ax.figure.canvas.set_window_title(title)
+    labels = 'false positives', 'false negatives', 'true positives'
+    width = 0.5
+
+    blue = [0, .4, .6]
+    yellow = [1, 0.65, 0.25]
+    red = [1, 0, 0]
+    res1 = ax.bar([1], [1], color=red, edgecolor='white', hatch=".", width=width)
+    res2 = ax.bar([1], [2], bottom=[1], color=yellow, edgecolor="white", hatch="x", width=width)
+    res3 = ax.bar([1], [3], bottom=[2], color=blue, edgecolor="white", width=width)
+    ax.cla()
+    plt.axis('off')
+    ax.legend((res1[0], res2[0], res3[0]), labels, loc="center", handleheight=3)
+
+
+def get_xticks_bars(confidence_thresholds, n=10, to_float=True):
+    # x ticks
+    step = int(len(confidence_thresholds) / n)
+    x = []
+    for confidence_threshold in confidence_thresholds:
+        xi = float_printer(confidence_threshold) if to_float else confidence_threshold
+        x.append(xi)
+    xticks = [x[i * step] for i in range(n)]
+    return x, xticks
+
+
+def plot_decisions_of_two_approaches(monitor1, history1: History, confidence_threshold1: float,
+                                     monitor2, history2: History, confidence_threshold2: float,
+                                     classes_network: list, classes_rest: list):
+    # collect data
+    m_id1 = monitor1 if isinstance(monitor1, int) else monitor1.id()
+    m_id2 = monitor2 if isinstance(monitor2, int) else monitor2.id()
+    ground_truths = history1.ground_truths
+    predictions = history1.predictions
+    results1 = history1.monitor2results[m_id1]
+    results2 = history2.monitor2results[m_id2]
+    class2category2numbers = dict()
+    category2correctness2numbers = {"a1 a2": {True: 0, False: 0}, "a1 r2": {True: 0, False: 0},
+                                    "r1 a2": {True: 0, False: 0}, "r1 r2": {True: 0, False: 0}}
+    known_category2correctness2numbers = {"a1 a2": {True: 0, False: 0}, "a1 r2": {True: 0, False: 0},
+                                          "r1 a2": {True: 0, False: 0}, "r1 r2": {True: 0, False: 0}}
+    novel_category2numbers = {"a1 a2": 0, "a1 r2": 0, "r1 a2": 0, "r1 r2": 0}
+    all_classes = sorted(set(classes_network + classes_rest))
+    n_classes = len(all_classes)
+    for class_id in all_classes:
+        class2category2numbers[class_id] = {"a1 a2": 0, "a1 r2": 0, "r1 a2": 0, "r1 r2": 0}
+    for gt, pd, r1, r2 in zip(ground_truths, predictions, results1, results2)\
+            :  # type: int, int, MonitorResult, MonitorResult
+        if r1.accepts(confidence_threshold1):
+            if r2.accepts(confidence_threshold2):
+                category = "a1 a2"
+            else:
+                category = "a1 r2"
+        else:
+            if r2.accepts(confidence_threshold2):
+                category = "r1 a2"
+            else:
+                category = "r1 r2"
+        class2category2numbers[gt][category] += 1
+        category2correctness2numbers[category][gt == pd] += 1
+        if gt in classes_network:
+            known_category2correctness2numbers[category][gt == pd] += 1
+        else:
+            novel_category2numbers[category] += 1
+
+    # create figures
+    fig, ax, n_cols, row, col = initialize_subplots(4, "Comparison with confidences {:f} and {:f}".format(
+        confidence_threshold1, confidence_threshold2))
+    x = ["a1 a2", "a1 r2", "r1 a2", "r1 r2"]
+
+    # plot comparison by classes
+    sums = [0 for _ in range(4)]
+    colors = get_rgb_colors(n_classes)
+    for i, class_id in enumerate(all_classes):
+        current = [class2category2numbers[class_id][x[i]] for i in range(4)]
+        is_known_class = class_id in classes_network
+        label = "class {:d} ({})".format(class_id, "o" if is_known_class else "n")
+        ax[0][0].bar(x, current, bottom=sums, color=colors[i], edgecolor='white', width=0.5, label=label)
+        for i in range(4):
+            sums[i] += current[i]
+    ax[0][0].set_xlabel("By classes")
+    ax[0][0].legend()
+
+    # plot comparison by correct/incorrect
+    current = [category2correctness2numbers[x[i]][True] for i in range(4)]
+    ax[0][1].bar(x, current, color="b", edgecolor='white', width=0.5, label="correct")
+    current2 = [category2correctness2numbers[x[i]][False] for i in range(4)]
+    ax[0][1].bar(x, current2, bottom=current, color="r", edgecolor='white', width=0.5, label="incorrect")
+    ax[0][1].set_xlabel("All classes")
+    ax[0][1].legend()
+
+    # plot comparison by correct/incorrect for known classes
+    current = [known_category2correctness2numbers[x[i]][True] for i in range(4)]
+    ax[1][0].bar(x, current, color="b", edgecolor='white', width=0.5, label="correct")
+    current2 = [known_category2correctness2numbers[x[i]][False] for i in range(4)]
+    ax[1][0].bar(x, current2, bottom=current, color="r", edgecolor='white', width=0.5, label="incorrect")
+    ax[1][0].set_xlabel("Known classes")
+    ax[1][0].legend()
+
+    # plot comparison by correct/incorrect for novel classes
+    current = [novel_category2numbers[x[i]] for i in range(4)]
+    ax[1][1].bar(x, current, color="r", edgecolor='white', width=0.5)
+    ax[1][1].set_xlabel("Novel classes")
+
+    plt.draw()
+    plt.pause(0.0001)
+
+
+# taken from https://stackoverflow.com/a/26369255
+def save_all_figures(figs=None, extension="pdf", close=False):
+    if figs is None:
+        figs = [plt.figure(n) for n in plt.get_fignums()]
+    for fig in figs:  # type
+        fig.savefig("../{}.{}".format(fig._suptitle._text, extension))
+        if close:
+            plt.close(fig)
+
+##### FILE: C:\work\original\utils\Statistics.py #####
+
+from .Helpers import *
+
+
+# for terminology see https://en.wikipedia.org/wiki/Receiver_operating_characteristic
+class Statistics(object):
+    def __init__(self):
+        self.time_training_model = -1
+        self.time_training_monitor_value_extraction = -1
+        self.time_training_monitor_clustering = -1
+        self.time_training_monitor_tweaking = -1
+        self.time_running_monitor_value_extraction = -1
+        self.time_running_monitor_classification = -1
+        self.time_tweaking_each_monitor = dict()
+        self.time_running_each_monitor = dict()
+
+##### FILE: C:\work\original\utils\StatisticsPrinter.py #####
+
+from . import *
+
+
+def print_statistics(statistics: Statistics, monitor_manager, n_train_model: int, n_train_monitor: int,
+                     n_test_monitor: int, n_run: int, epochs: int, novelty_wrapper: NoveltyWrapper, history: History,
+                     confidence_thresholds: list):
+    print("\n--- final statistics ---\n")
+
+    # general statistics
+    print("overall statistics")
+    if statistics.time_training_model > 0:
+        print("{} seconds for training model on {:d} samples with {:d} epochs".format(
+            float_printer(statistics.time_training_model), n_train_model, epochs))
+    print("{} seconds for extracting {:d} values during monitor training".format(
+        float_printer(statistics.time_training_monitor_value_extraction), n_train_monitor))
+    print("{} seconds for clustering during monitor training".format(
+        float_printer(statistics.time_training_monitor_clustering)))
+    print("{} seconds for monitor training on {:d} samples".format(
+        float_printer(statistics.time_training_monitor_tweaking), n_train_monitor))
+    print("{} seconds for extracting {:d} values during running the monitored session".format(
+        float_printer(statistics.time_running_monitor_value_extraction), n_run))
+    print("{} seconds for running the monitored session on {:d} samples".format(
+        float_printer(statistics.time_running_monitor_classification), n_run))
+    correct_classifications, incorrect_classifications = history.classification_statistics()
+    n = correct_classifications
+    d = correct_classifications + incorrect_classifications
+    print("success rate of the unmonitored classifier: {:d} / {:d} = {:.2f} % ({:d} misclassifications)".format(
+        n, d, ratio(n, d), incorrect_classifications))
+
+    # individual statistics for each monitor
+    monitors = monitor_manager.monitors()
+    for i, monitor in enumerate(monitors):
+        m_id = monitor.id()
+        print("\nprinting statistics for monitor {:d} with abstraction structure {}".format(m_id, monitor.short_str()))
+        print("{} seconds for training the monitor on {:d} samples".format(
+            float_printer(statistics.time_tweaking_each_monitor[m_id]), n_train_monitor))
+        print("{} seconds for running the monitor on {:d} samples".format(
+            float_printer(statistics.time_running_each_monitor[m_id]), n_run))
+        for confidence_threshold in confidence_thresholds:
+            print("\n confidence threshold {:f} ".format(confidence_threshold))
+            # recompute statistics for the monitor and confidence threshold
+            history.update_statistics(m_id, confidence_threshold=confidence_threshold)
+            tn = history.true_negatives()
+            tp = history.true_positives()
+            fn = history.false_negatives()
+            fp = history.false_positives()
+            zero_filtered = history.zero_filtered()
+            tn_string = str(tn)
+            tp_string = str(tp)
+            fp_string = str(fp)
+            fn_string = str(fn)
+            zero_filtered_string = str(zero_filtered)
+            tn_string, tp_string, fp_string, fn_string, zero_filtered_string =\
+                extend([tn_string, tp_string, fp_string, fn_string, zero_filtered_string])
+            print(tn_string, "samples were classified   correctly and accepted by the monitor (+) (",
+                  float_printer(ratio(tn, n_run)), "%)")
+            print(fp_string, "samples were classified   correctly but rejected by the monitor (-) (",
+                  float_printer(ratio(fp, n_run)), "%)")
+            print(tp_string, "samples were classified incorrectly and rejected by the monitor (+) (",
+                  float_printer(ratio(tp, n_run)), "%)")
+            print(fn_string, "samples were classified incorrectly but accepted by the monitor (-) (",
+                  float_printer(ratio(fn, n_run)), "%)")
+            print(zero_filtered_string, "samples were rejected by default because of a mismatch in the " +
+                  "zero-dimension pattern ({}%)".format(float_printer(ratio(zero_filtered, n_run))))
+            n = tp
+            d = tp + fn
+            print("detection rate of the monitor:", n, "/", d, "=", float_printer(ratio(n, d)),
+                  "% (of the incorrectly classified samples)")
+            n = fp
+            d = fp + tn
+            print("false-warning rate of the monitor:", n, "/", d, "=", float_printer(ratio(n, d)),
+                  "% (of the correctly classified samples)")
+            novelties = novelty_wrapper.evaluate_detection(m_id, confidence_threshold)
+            n = len(novelties["detected"])
+            d = n + len(novelties["undetected"])
+            print("novelty detection: {:d} / {:d}".format(n, d))
+    print()
+
+    # plot statistics after timers
+    if PLOT_MONITOR_PERFORMANCE:
+        factors = [1, -1] if monitor_manager._alpha_thresholding else [1]
+        for i, monitor in enumerate(monitors):
+            for factor in factors:
+                m_id = monitor.id() * factor
+                for confidence_threshold in confidence_thresholds:
+                    # recompute statistics for the given monitor
+                    history.update_statistics(m_id, confidence_threshold=confidence_threshold)
+                    tn = history.true_negatives()
+                    tp = history.true_positives()
+                    fn = history.false_negatives()
+                    fp = history.false_positives()
+                    fig, ax = initialize_single_plot("Performance of monitor {:d} & confidence >= {:f}".format(
+                        m_id, confidence_threshold))
+                    plot_pie_chart_single(ax=ax, tp=tp, tn=tn, fp=fp, fn=fn, n_run=n_run)
+        fig, ax = initialize_single_plot("Performance of monitor (legend)")
+        plot_pie_chart_single(ax=ax, tp=0, tn=0, fp=0, fn=0, n_run=-1)
+
+##### FILE: C:\work\original\utils\__init__.py #####
+
+from .Logger import *
+from .Options import *
+from .CoreStatistics import *
+from .Helpers import *
+from .DataSpec import *
+from .Anomaly import *
+from .NoveltyWrapper import *
+from .ConditionalNoveltyWrapper import *
+from .MonitorResult import *
+from .History import *
+from .CombinedHistory import *
+from .ConditionalHistory import *
+from .LoadData import *
+from .Plotting import *
+from .Statistics import *
+from .StatisticsPrinter import *
+from .Clustering import cluster_refinement, cluster_number, cluster_center
+from .Partitioning import uniform_partition
+from .Confidence import *
+
+from .ModelCreator import *
+
+##### FILE: C:\work\original\trainers\CustomTrainer.py #####
+
+from tensorflow_core.python.keras.losses import SparseCategoricalCrossentropy
+from tensorflow_core.python.keras.optimizers import Adam
+from tensorflow_core.python.keras.metrics import Mean, SparseCategoricalAccuracy
+import tensorflow_core as tf
+
+from .Trainer import Trainer
+from utils import *
+
+
+class CustomTrainer(Trainer):
+    """
+    This trainer follows https://www.tensorflow.org/beta/tutorials/quickstart/advanced .
+    """
+    def __init__(self):
+        # loss function for training
+        self.loss_object = SparseCategoricalCrossentropy()
+        # optimizer for training
+        self.optimizer = Adam()
+        # metrics to measure the loss and the accuracy of the model
+        self.train_loss = Mean(name='train_loss')
+        self.train_accuracy = SparseCategoricalAccuracy(name='train_accuracy')
+        self.test_loss = Mean(name='test_loss')
+        self.test_accuracy = SparseCategoricalAccuracy(name='test_accuracy')
+
+    def __str__(self):
+        return "CustomTrainer"
+
+    @tf.function
+    def train_step(self, inputs, classes, model):
+        with tf.GradientTape() as tape:
+            predictions = model(inputs)
+            loss = self.loss_object(classes, predictions)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+        self.train_loss(loss)
+        self.train_accuracy(classes, predictions)
+
+    @tf.function
+    def test_step(self, inputs, classes, model):
+        predictions = model(inputs)
+        loss = self.loss_object(classes, predictions)
+
+        self.test_loss(loss)
+        self.test_accuracy(classes, predictions)
+
+    def print_summary(self, epoch):
+        template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+        print(template.format(epoch + 1,
+                              self.train_loss.result(),
+                              self.train_accuracy.result() * 100,
+                              self.test_loss.result(),
+                              self.test_accuracy.result() * 100))
+
+    def train_epoch(self, model, train_ds, test_ds, epoch, data_train: DataSpec, data_test: DataSpec):
+        for train_inputs, train_classes in train_ds:
+            self.train_step(train_inputs, train_classes, model)
+
+        for test_inputs, test_classes in test_ds:
+            self.test_step(test_inputs, test_classes, model)
+
+        if VERBOSE_MODEL_TRAINING:
+            self.print_summary(epoch)
+
+        # never terminate earlier
+        return False
+
+    def train(self, model, data_train: DataSpec, data_test: DataSpec, epochs, batch_size):
+        x_train = data_train.x()
+        y_train = data_train.y()
+        x_test = data_test.x()
+        y_test = data_test.y()
+
+        y_train = to_classes(y_train)
+        y_test = to_classes(y_test)
+
+        train_ds = to_dataset(x_train, y_train, batch_size)
+        test_ds = to_dataset(x_test, y_test, batch_size)
+
+        for epoch in range(epochs):
+            stop = self.train_epoch(model, train_ds, test_ds, epoch, data_train, data_test)
+            if stop:
+                break
+
+        # TODO return the history
+        return None
+
+##### FILE: C:\work\original\trainers\MonitoredTrainer.py #####
+
+from .CustomTrainer import CustomTrainer
+from monitoring import *
+from utils import *
+
+
+class MonitoredTrainer(CustomTrainer):
+    def __init__(self, abstractions, layer_index, n_classes, adaptive_monitoring):
+        super(MonitoredTrainer, self).__init__()
+        self.abstractions = abstractions
+        self.layer_index = layer_index
+        self.n_classes = n_classes
+        self.adaptive = adaptive_monitoring
+
+    def __str__(self):
+        return "MonitoredTrainer"
+
+    def train_epoch(self, model, train_ds, test_ds, epoch, data_train: DataSpec, data_test: DataSpec):
+        super(MonitoredTrainer, self).train_epoch(model, train_ds, test_ds, epoch, data_train, data_test)
+
+        # train abstraction
+        if epoch > 0:
+            for a in self.abstractions:
+                a.clear()
+        monitors = [Monitor(self.layer_index, a, self.adaptive) for a in self.abstractions]
+        monitor_manager = MonitorManager(model, monitors, TRAINING_POLICY_GROUND_TRUTH)
+        monitor_manager.train_monitors(data_train)
+
+        # evaluate abstraction
+        statistics = Statistics()
+        monitor_manager.run_monitors(self.n_classes, data_test, statistics, verbose=False,
+                                     compute_alternative_classes=False, print_result=True)
+
+        # terminate if there are no false characterizations in the test set
+        for i in range(len(self.abstractions)):
+            statistics.update_statistics(i)
+            if statistics.false_negatives() + statistics.false_positives() > 0:
+                return False
+        return True
+
+##### FILE: C:\work\original\trainers\StandardTrainer.py #####
+
+from .Trainer import Trainer
+from utils import *
+
+
+class StandardTrainer(Trainer):
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "StandardTrainer"
+
+    def train(self, model, data_train: DataSpec, data_test: DataSpec, epochs: int, batch_size: int):
+        history = model.fit(data_train.x(), np.array(data_train.ground_truths()), epochs=epochs, batch_size=batch_size)
+
+        if VERBOSE_MODEL_TRAINING:
+            print("score:", model.evaluate(data_test.x(), data_test.y(), batch_size=batch_size))
+            print(model.summary())
+
+        return history
+
+        # input_prediction = x_test_final[0:1, :]
+        # prediction = model.predict(input_prediction, 1, 1)
+        # predicted_class = np.argmax(prediction)
+        # print("testing prediction:\n input: ", input_prediction,
+        #       "\n output: ", prediction,
+        #       "\n class (in [0,", n_classes, "]): ", predicted_class)
+
+        # Testing
+        # layer_outs = get_watched_values(model, x_train[0:1, :])
+        # print(layer_outs)
+
+##### FILE: C:\work\original\trainers\Trainer.py #####
+
+class Trainer(object):
+    pass
+
+##### FILE: C:\work\original\trainers\TrainerMain.py #####
+
+from utils import *
+from data import *
+from trainers import StandardTrainer
+
+
+def run_training(data_name, data_train_model, data_test_model, model_name, model_path, n_epochs, batch_size,
+                 model_trainer=StandardTrainer(), seed=0, plot_name=""):
+    # set random seed
+    set_random_seed(seed)
+
+    # construct statistics wrapper
+    statistics = Statistics()
+
+    # load data
+    data_train_monitor = DataSpec()
+    data_test_monitor = DataSpec()
+    data_run = DataSpec()
+    all_classes_network, labels_network, all_classes_rest, labels_rest = get_data_loader(data_name)(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run)
+
+    print("Data: classes {} with {:d} inputs (model training), classes {} with {:d} inputs (model test)".format(
+        classes2string(data_train_model.classes), data_train_model.n, classes2string(data_test_model.classes),
+        data_test_model.n))
+
+    # create and train network model
+    model, history_model = get_model(model_name=model_name, data_train=data_train_model, data_test=data_test_model,
+                                     n_classes=len(labels_network), model_trainer=model_trainer, n_epochs=n_epochs,
+                                     batch_size=batch_size, statistics=statistics, model_path=model_path)
+
+    # plot history
+    if plot_name is not None:
+        plot_model_history(history_model)
+        if plot_name != "":
+            figs = [plt.figure(n) for n in plt.get_fignums()]
+            if len(figs) == 1:
+                figs[0].savefig("../training_{}.pdf".format(plot_name))
+                plt.close()
+            else:
+                save_all_figures(figs)
+                plt.close("all")
+
+    return model, statistics, history_model
+
+##### FILE: C:\work\original\trainers\__init__.py #####
+
+from .StandardTrainer import StandardTrainer
+from .CustomTrainer import CustomTrainer
+from .MonitoredTrainer import MonitoredTrainer
+from .Trainer import Trainer
+
+from .TrainerMain import run_training
+
+##### FILE: C:\work\original\monitoring\EvaluateCombination.py #####
+
+from monitoring import *
+from run.Runner import run
+from utils import *
+from data import *
+from trainers import *
+
+
+def evaluate_all(model_name, model_path, data_name, data_train_model, data_test_model, data_train_monitor,
+                 data_test_monitor, data_run, monitor_manager: MonitorManager, alphas=None,
+                 model_trainer=StandardTrainer(), seed=0, n_epochs=-1, batch_size=-1):
+    # set random seed
+    set_random_seed(seed)
+
+    # construct statistics wrapper
+    statistics = Statistics()
+
+    # load data
+    all_classes_network, labels_network, all_classes_rest, labels_rest = get_data_loader(data_name)(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run)
+
+    # load network model or create and train it
+    model, history_model = get_model(model_name=model_name, data_train=data_train_model, data_test=data_test_model,
+                                     n_classes=len(labels_network), model_trainer=model_trainer, n_epochs=n_epochs,
+                                     batch_size=batch_size, statistics=statistics, model_path=model_path)
+
+    print(("Data: classes {} with {:d} inputs (monitor training), classes {} with {:d} inputs (monitor test), " +
+          "classes {} with {:d} inputs (monitor run)").format(
+        classes2string(data_train_monitor.classes), data_train_monitor.n,
+        classes2string(data_test_monitor.classes), data_test_monitor.n,
+        classes2string(data_run.classes), data_run.n))
+
+    # normalize and initialize monitors
+    monitor_manager.normalize_and_initialize(model, len(labels_rest))
+
+    # train monitors
+    monitor_manager.train(model=model, data_train=data_train_monitor, data_test=data_test_monitor,
+                          statistics=statistics)
+
+    # run monitors & collect novelties
+    history_run = monitor_manager.run(model=model, data=data_run, statistics=statistics)
+    novelty_wrapper_run = history_run.novelties(data_run, all_classes_network, all_classes_rest)
+
+    if alphas is None:
+        return history_run, novelty_wrapper_run, statistics
+
+    # run alpha threshold
+    histories_alpha_thresholding = []
+    novelty_wrappers_alpha_thresholding = []
+    for alpha in alphas:
+        history_alpha_thresholding = History()
+        test_alpha(model, data_run, history_alpha_thresholding, alpha)
+        novelty_wrapper_alpha_thresholding =\
+            history_alpha_thresholding.novelties(data_run, all_classes_network, all_classes_rest)
+        histories_alpha_thresholding.append(history_alpha_thresholding)
+        novelty_wrappers_alpha_thresholding.append(novelty_wrapper_alpha_thresholding)
+
+    return history_run, histories_alpha_thresholding, novelty_wrapper_run, novelty_wrappers_alpha_thresholding,\
+           statistics
+
+
+def evaluate_combination(seed, data_name, data_train_model, data_test_model, data_train_monitor, data_test_monitor,
+                         data_run, model_trainer, model_name, model_path, n_epochs, batch_size,
+                         monitor_manager: MonitorManager, alpha, confidence_thresholds=None, skip_image_plotting=False):
+
+    # convex-set monitoring
+    model, history_abstraction, classes_network, labels_network, classes_rest, labels_rest, statistics = run(
+        seed, data_name, data_train_model, data_test_model, data_train_monitor, data_test_monitor, data_run,
+        model_trainer, model_name, model_path, n_epochs, batch_size, monitor_manager, confidence_thresholds,
+        skip_image_plotting, show_statistics=False)
+
+    # alpha-threshold monitoring
+    history_alpha_thresholding = History()
+    test_alpha(model, data_run, history_alpha_thresholding, alpha)
+
+    # combinations
+    history_combined = CombinedHistory([history_abstraction, history_alpha_thresholding])
+    history_conditional_abs_at = ConditionalHistory([history_abstraction], [history_alpha_thresholding], alpha)
+    history_conditional_at_abs = ConditionalHistory([history_alpha_thresholding], [history_abstraction], alpha)
+    n_monitors = len(monitor_manager.monitors()) + 1
+
+    # bin plots
+    plot_false_decisions(monitors=monitor_manager.monitors(), history=history_abstraction,
+                         confidence_thresholds=confidence_thresholds)
+    plot_false_decisions(monitors=[0], history=history_alpha_thresholding, confidence_thresholds=confidence_thresholds,
+                         name="alpha threshold")
+    for i in range(1, n_monitors + 1):
+        # plot_false_decisions(monitors=[0], history=history_combined, confidence_thresholds=confidence_thresholds,
+        #                      n_min_acceptance=i)
+        plot_false_decisions(monitors=[0], history=history_combined, confidence_thresholds=confidence_thresholds,
+                             n_min_acceptance=-i)
+    plot_false_decisions(monitors=[0], history=history_conditional_abs_at, confidence_thresholds=confidence_thresholds,
+                         name="abstraction then alpha threshold")
+    plot_false_decisions(monitors=[0], history=history_conditional_at_abs, confidence_thresholds=confidence_thresholds,
+                         name="alpha threshold then abstraction")
+
+    # pie plots
+    # for monitor in monitor_manager.monitors():
+    #     m_id = monitor.id()
+    #     pie_plot(data_run, m_id, history_abstraction, alpha=confidence_thresholds[0])
+    #     pie_plot(data_run, m_id, history_abstraction, alpha=confidence_thresholds[-1])
+    # pie_plot(data_run, 0, history_alpha_thresholding, alpha=confidence_thresholds[0])
+    # pie_plot(data_run, 0, history_alpha_thresholding, alpha=confidence_thresholds[-1])
+
+    # novelty bin plots
+    novelty_wrapper_abstraction = history_abstraction.novelties(data_run, classes_network, classes_rest)
+    plot_novelty_detection(monitor_manager.monitors(), novelty_wrapper_abstraction, confidence_thresholds)
+    novelty_wrapper_alpha_thresholding = history_alpha_thresholding.novelties(data_run, classes_network, classes_rest)
+    plot_novelty_detection([0], novelty_wrapper_alpha_thresholding, confidence_thresholds, name="alpha threshold")
+    novelty_wrapper_combined = history_combined.novelties(data_run, classes_network, classes_rest)
+    for i in range(1, n_monitors + 1):
+        # plot_novelty_detection([0], novelty_wrapper_combined, confidence_thresholds, n_min_acceptance=i)
+        plot_novelty_detection([0], novelty_wrapper_combined, confidence_thresholds, n_min_acceptance=-i)
+    novelty_wrapper_conditional1 = history_conditional_abs_at.novelties(data_run, classes_network, classes_rest)
+    plot_novelty_detection([0], novelty_wrapper_conditional1, confidence_thresholds,
+                           name="abstraction then alpha threshold")
+    novelty_wrapper_conditional2 = history_conditional_at_abs.novelties(data_run, classes_network, classes_rest)
+    plot_novelty_detection([0], novelty_wrapper_conditional2, confidence_thresholds,
+                           name="alpha threshold then abstraction")
+
+    # comparison plots
+    confidence_threshold1_default = 0.0
+    confidence_threshold2_default = alpha
+    while True:
+        answer = input("Show comparison plots [y, n]? ")
+        if answer == "n":
+            break
+        confidence_threshold1 = input("confidence threshold 1 [empty string for default {:f}]? ".format(
+            confidence_threshold1_default))
+        confidence_threshold2 = input("confidence threshold 1 [empty string for default {:f}]? ".format(
+            confidence_threshold2_default))
+        if confidence_threshold1 == "":
+            confidence_threshold1 = confidence_threshold1_default
+        else:
+            confidence_threshold1 = float(confidence_threshold1)
+        if confidence_threshold2 == "":
+            confidence_threshold2 = confidence_threshold2_default
+        else:
+            confidence_threshold2 = float(confidence_threshold2)
+        plot_decisions_of_two_approaches(monitor_manager.monitors()[0], history_abstraction, confidence_threshold1,
+                                         0, history_alpha_thresholding, confidence_threshold2, classes_network,
+                                         classes_rest)
+
+    # ROC curve
+    for monitor in monitor_manager.monitors():
+        ROC_plot(monitor.id(), history_abstraction)
+    ROC_plot(0, history_alpha_thresholding, name="alpha threshold")
+    for i in range(1, n_monitors + 1):
+        # ROC_plot(0, history_combined, n_min_acceptance=i)
+        ROC_plot(0, history_combined, n_min_acceptance=-i)
+    ROC_plot(0, history_conditional_abs_at, name="abstraction then alpha threshold")
+    ROC_plot(0, history_conditional_at_abs, name="alpha threshold then abstraction")
+
+    # print("\nDone! In order to keep the plots alive, this program does not terminate until they are closed.")
+    # plt.show()
+    answer = input("Save all plots [y, n]? ")
+    if answer == "y":
+        save_all_figures()
+
+
+def pie_plot(data_run, monitor_id, history_alpha_thresholding, alpha):
+    history_alpha_thresholding.update_statistics(monitor_id, alpha)
+    tn = history_alpha_thresholding.true_negatives()
+    tp = history_alpha_thresholding.true_positives()
+    fn = history_alpha_thresholding.false_negatives()
+    fp = history_alpha_thresholding.false_positives()
+    fig, ax = initialize_single_plot("Performance of monitor {:d} with confidence >= {:f}".format(monitor_id, alpha))
+    plot_pie_chart_single(ax=ax, tp=tp, tn=tn, fp=fp, fn=fn, n_run=data_run.n)
+
+
+def ROC_plot(monitor_id, history, n_min_acceptance=None, name=None):
+    fp_list = []
+    tp_list = []
+    for alpha in range(0, 100, 1):
+        history.update_statistics(monitor_id, float(alpha) / 100.0, n_min_acceptance=n_min_acceptance)
+        fp_list.append(history.false_positive_rate())
+        tp_list.append(history.true_positive_rate())
+
+    fig, ax = plt.subplots(1, 1)
+    if name is None:
+        if n_min_acceptance is None:
+            name = "{:d}".format(monitor_id)
+        else:
+            if n_min_acceptance >= 0:
+                name = "acceptance {:d}".format(n_min_acceptance)
+            else:
+                name = "rejection {:d}".format(-n_min_acceptance)
+    title = "ROC curve (monitor {})".format(name)
+    fig.suptitle(title)
+    fig.canvas.set_window_title(title)
+    # plot ROC curve
+    ax.cla()
+    ax.scatter(fp_list, tp_list, marker='^', c="r")
+    ax.plot([0, 1], [0, 1], label="baseline", c="k", linestyle=":")
+    ax.set_title('ROC curve')
+    ax.set_xlabel('False positive rate')
+    ax.set_ylabel('True positive rate')
+    ax.legend()
+    plt.draw()
+    plt.pause(0.0001)
+
+##### FILE: C:\work\original\monitoring\Monitor.py #####
+
+import itertools
+from copy import deepcopy
+
+from . import *
+from utils import *
+from abstractions import *
+
+
+class Monitor(object):
+    """
+    A monitor consists of layer-abstraction mappings. It can evaluate a given input based on its abstractions.
+
+    The acceptance behavior of a monitor is defined in the class MonitorResult.
+
+    Fields:
+     - _layer2abstraction: mapping 'layer â†’ abstraction'
+     - _score_fun: score function for training (see Score class)
+                   The value 'None' means that this monitor is not trained.
+                   default: AverageScore()
+    """
+
+    _id_iter = itertools.count()
+
+    # --- public --- #
+
+    def __init__(self, layer2abstraction: dict, score_fun=AverageScore(), layer2dimensions=None,
+                 learn_from_test_data=False, is_novelty_training_active=False):
+        self._id = next(Monitor._id_iter)
+        if self._id == 0:
+            self._id = next(Monitor._id_iter)  # start with '1'
+        self._layer2abstraction = layer2abstraction
+        self._score_fun = score_fun
+        if layer2dimensions is None:
+            layer2dimensions = {layer: [0, 1] for layer in self._layer2abstraction.keys()}
+        self._layer2dimensions = layer2dimensions
+        self._layer2class2dimensions = None
+        self._learn_from_test_data = learn_from_test_data
+        self._is_novelty_training_active = is_novelty_training_active
+
+    @staticmethod
+    def reset_ids():
+        Monitor._id_iter = itertools.count()
+
+    def __str__(self):
+        return "Monitor {:d}".format(self.id())
+
+    def id(self):
+        return self._id
+
+    def layers(self):
+        return self._layer2abstraction.keys()
+
+    def abstraction(self, layer):
+        return self._layer2abstraction[layer]
+
+    def short_str(self):
+        string = ""
+        for l, a in self._layer2abstraction.items():
+            if string != "":
+                string += ", "
+            string += "layer {:d}: {}".format(l, a.short_str())
+        return string
+
+    def long_str(self):
+        string = ""
+        for l, a in self._layer2abstraction.items():
+            if string != "":
+                string += ", "
+            string += "layer {:d}: {}".format(l, a.long_str())
+        return string
+
+    def dimensions(self, layer, class_id=None):
+        if class_id is not None and self._layer2class2dimensions is not None:
+            return self._layer2class2dimensions[layer][class_id]
+        return self._layer2dimensions[layer]
+
+    def normalize_and_initialize(self, model, n_classes):
+        layer2abstraction_new = dict()
+        for layer, abstraction in self._layer2abstraction.items():  # type: int, Abstraction
+            # normalize layer index
+            layer_normalized = normalize_layer(model, layer)
+
+            # obtain number of neurons
+            n_neurons = model.layers[layer_normalized].output_shape[1]
+
+            # normalize abstraction (wrap in AbstractionVectors)
+            if isinstance(abstraction, AbstractionVector):
+                assert len(abstraction._abstractions) == n_classes, "Detected wrong number of abstractions!"
+                abstraction_new = abstraction
+            else:
+                abstraction_new = AbstractionVector(abstraction, n_classes)
+
+            # initialize abstraction
+            abstraction_new.initialize(n_neurons)
+
+            # update new mapping
+            if layer_normalized in layer2abstraction_new:
+                raise(ValueError("Duplicate layer index", layer_normalized, "found. Please use unique indexing."))
+            layer2abstraction_new[layer_normalized] = abstraction_new
+        self._layer2abstraction = layer2abstraction_new
+
+        layer2dimensions_new = dict()
+        for layer, dimensions in self._layer2dimensions.items():  # type: int, list
+            # normalize layer index
+            layer_normalized = normalize_layer(model, layer)
+            if layer_normalized in layer2dimensions_new:
+                raise(ValueError("Duplicate layer index", layer_normalized, "found. Please use unique indexing."))
+            layer2dimensions_new[layer_normalized] = dimensions
+        self._layer2dimensions = layer2dimensions_new
+
+    def initialize_abstractions(self, layer2class2nonzero_mask):
+        self._layer2class2dimensions = dict()
+        for layer, abstraction_vector in self._layer2abstraction.items():  # type: int, AbstractionVector
+            class2dimensions = dict()
+            self._layer2class2dimensions[layer] = class2dimensions
+            original_dimensions = self._layer2dimensions[layer]
+            class2nonzero_mask = layer2class2nonzero_mask[layer]  # type: dict
+            for class_id, nonzero_mask in class2nonzero_mask.items():
+                abstraction = abstraction_vector._abstractions[class_id]
+                abstraction.initialize(sum([1 if nonzero else 0 for nonzero in nonzero_mask]))
+                # adapt plotting dimension
+                dimensions = []
+                for dim in [0, 1]:
+                    res = original_dimensions[dim]
+                    if not nonzero_mask[res]:
+                        res = -1
+                    else:
+                        res -= sum(not is_nz for is_nz in nonzero_mask[:res + 1])
+                    dimensions.append(res)
+                class2dimensions[class_id] = dimensions
+
+    def update_clustering(self, layer: int, class2clusters: dict):
+        abstraction_vector = self._layer2abstraction.get(layer)
+        if abstraction_vector is None:
+            # this monitor does not watch the given layer
+            return
+
+        assert isinstance(abstraction_vector, AbstractionVector)
+        for class_index, clusters in class2clusters.items():
+            abstraction_vector.update_clustering(class_index, clusters)
+
+    def add_clustered(self, layer2values, ground_truths, layer2class2clusterer):
+        for layer, abstraction_vector in self._layer2abstraction.items():
+            values = layer2values[layer]
+
+            # mapping: class_index -> values from watched layer
+            class2values = dict()
+            for j, yj in enumerate(ground_truths):
+                vj = values[j]
+                if yj in class2values:
+                    class2values[yj].append(vj)
+                else:
+                    class2values[yj] = [vj]
+
+            class2clusters = layer2class2clusterer[layer]
+            for class_index, values in class2values.items():
+                clusterer = class2clusters[class_index]
+                values_copy = deepcopy(values)  # for some reason, the list is modified below
+                abstraction_vector.add_clustered(class_index, values_copy, clusterer)
+
+    def train_with_novelties(self, predictions: list, layer2values: dict):
+        for layer, abstraction in self._layer2abstraction.items():
+            for pj, vj in zip(predictions, layer2values[layer]):
+                abstraction.isknown(pj, vj, novelty_mode=True)
+        for abstraction_vector in self._layer2abstraction.values():  # type: AbstractionVector
+            for abstraction in abstraction_vector.abstractions():
+                abstraction.compute_credibility(len(predictions))
+
+    def run(self, layer2values: dict, predictions: list, history: History, zero_filter: list, skip_confidence=False):
+        results = [MonitorResult() for _ in predictions]
+        for layer, abstraction in self._layer2abstraction.items():
+            if zero_filter:
+                zero_filter_index = 0
+                zero_filter_value = zero_filter[0]
+            else:
+                zero_filter_index = -1
+                zero_filter_value = -1
+            for j, vj in enumerate(layer2values[layer]):
+                if j == zero_filter_value:
+                    results[j].set_zero_filter()
+
+                    # find next zero index
+                    zero_filter_index += 1
+                    if zero_filter_index == len(zero_filter):
+                        zero_filter_value = -1
+                    else:
+                        zero_filter_value = zero_filter[zero_filter_index]
+                else:
+                    c_predicted = predictions[j]
+                    accepts, confidence = abstraction.isknown(c_predicted, vj, skip_confidence=skip_confidence)
+                    results[j].add_confidence(confidence)
+        history.set_monitor_results(m_id=self.id(), results=results)
+        return results
+
+    def is_novelty_training_active(self):
+        return self._is_novelty_training_active
+
+    def is_test_training_active(self):
+        return self._learn_from_test_data
+
+##### FILE: C:\work\original\monitoring\MonitorManager.py #####
+
+from . import *
+from utils import *
+
+
+class MonitorManager(object):
+    # --- public --- #
+
+    def __init__(self, monitors: list, clustering_algorithm="KMeans", clustering_threshold=0.1, n_clusters=None,
+                 filter_zeros=FILTER_ZERO_DIMENSIONS, alpha_thresholding=False, skip_confidence=True):
+        self._monitors = monitors
+        self._alpha_thresholding = alpha_thresholding
+        self._layers = []
+        self.clustering_algorithm = clustering_algorithm
+        self.clustering_threshold = clustering_threshold
+        self.n_clusters = n_clusters
+        self.layer2class2nonzero_mask = dict() if filter_zeros else None
+        self.skip_confidence = skip_confidence
+        self.learn_from_test_data = any(m.is_test_training_active() for m in self._monitors)
+        self.learn_from_novelty_data = any(m.is_novelty_training_active() for m in self._monitors)
+
+    def layers(self):
+        return self._layers
+
+    def monitors(self):
+        return self._monitors
+
+    def normalize_and_initialize(self, model, n_classes):
+        layers = set()
+        for monitor in self._monitors:  # type: Monitor
+            monitor.normalize_and_initialize(model, n_classes)
+            layers.update(monitor.layers())
+        self._layers = list(layers)
+        print("Watching the following layers:")
+        for layer in self._layers:
+            print("- layer {:d} with {:d} neurons".format(layer, model.layers[layer].output_shape[1]))
+
+    def train(self, model, data_train: DataSpec, data_test: DataSpec, statistics: Statistics,
+              ignore_misclassifications=ONLY_LEARN_FROM_CORRECT_CLASSIFICATIONS):
+        print("\n--- monitor training ---\n")
+
+        # extract values for watched layers
+        print("extracting data for watched layers")
+        layer2values, timer = obtain_predictions(model=model, data=data_train, layers=self.layers(),
+                                                 ignore_misclassifications=ignore_misclassifications)
+        timer_sum = timer
+        if self.learn_from_test_data or self.learn_from_novelty_data:
+            layer2values_novel, timer = obtain_predictions(model=model, data=data_test, layers=self.layers())
+            timer_sum += timer
+            predictions_novel, timer = obtain_predictions(model=model, data=data_test)
+            timer_sum += timer
+        statistics.time_training_monitor_value_extraction = timer_sum
+
+        # filter out zero dimensions
+        if self.layer2class2nonzero_mask is not None:
+            assert not self.learn_from_test_data
+            self._determine_zero_filters(layer2values, model, data_train)
+            layer2values = self._remove_zero_dimensions(layer2values, data_train.ground_truths(),
+                                                        compute_violation_indices=False)
+            for monitor in self._monitors:
+                monitor.initialize_abstractions(self.layer2class2nonzero_mask)
+
+        # clustering
+        print("determining optimal clusters for each layer and class ({}, {})".format(
+            self.clustering_threshold, self.n_clusters))
+        layer2class2clusterer = self._clustering(data=data_train, layer2values=layer2values, statistics=statistics)
+        if self.learn_from_test_data:
+            data_train_combined = DataSpec(n=data_train.n + data_test.n, x=np.append(data_train.x(), data_test.x(), 0),
+                                           y=np.append(data_train.y(), data_test.y(), 0))
+            layer2values_combined = self._combine_layer2values(layer2values, layer2values_novel)
+            layer2class2clusterer_combined = self._clustering(data=data_train_combined,
+                                                              layer2values=layer2values_combined, statistics=statistics,
+                                                              includes_test_data=True)
+
+        # monitor training
+        print("training monitors on the obtained data")
+        self._train_monitors(data=data_train, layer2values=layer2values, layer2class2clusterer=layer2class2clusterer,
+                             predictions=None, statistics=statistics, includes_test_data=False)
+        if self.learn_from_test_data:
+            self._train_monitors(data=data_train_combined, layer2values=layer2values_combined,
+                                 layer2class2clusterer=layer2class2clusterer_combined, predictions=None,
+                                 statistics=statistics, includes_test_data=True)
+
+        if self.learn_from_novelty_data:
+            # novelty training
+            print("additional training of monitors on novelty data")
+            self._train_monitors(data=data_test, layer2values=layer2values_novel, layer2class2clusterer=None,
+                                 predictions=predictions_novel, statistics=statistics, includes_test_data=False)
+
+    def run(self, model, data: DataSpec, statistics: Statistics):
+        print("\n--- running monitored session ---\n")
+
+        history = History()
+        history.set_ground_truths(data.ground_truths())
+
+        # extract values for watched layers and predictions of model
+        layer2values, timer = obtain_predictions(model=model, data=data, layers=self.layers())
+        timer_sum = timer
+        predictions, timer = obtain_predictions(model=model, data=data)
+        timer_sum += timer
+        statistics.time_running_monitor_value_extraction = timer_sum
+        history.set_layer2values(layer2values)
+        history.set_predictions(predictions)
+
+        # filter out zero dimensions
+        if self.layer2class2nonzero_mask is not None:
+            layer2values, zero_filter = self._remove_zero_dimensions(layer2values, predictions,
+                                                                     compute_violation_indices=True)
+            print("Found {:d} inputs that do not match the 'zero pattern'.".format(len(zero_filter)))
+        else:
+            zero_filter = []
+
+        # run monitors
+        timer = time()
+        monitor2results = dict()
+        for monitor in self._monitors:  # type: Monitor
+            m_id = monitor.id()
+            print("running monitor {:d} on the inputs".format(m_id))
+            timer_monitor = time()
+            monitor_results = monitor.run(layer2values=layer2values, predictions=predictions, history=history,
+                                          zero_filter=zero_filter, skip_confidence=self.skip_confidence)
+            statistics.time_running_each_monitor[m_id] = time() - timer_monitor
+            monitor2results[m_id] = monitor_results
+            if self._alpha_thresholding:
+                self._compute_alpha_thresholding(monitor_results=monitor_results, model=model, data=data)
+                monitor2results[-m_id] = monitor_results
+                history.set_monitor_results(-m_id, monitor_results)
+        statistics.time_running_monitor_classification = time() - timer
+
+        return history
+
+    # --- private --- #
+
+    def _clustering(self, data, layer2values, statistics, includes_test_data=False):
+        layers = self.layers()
+
+        # cluster classes in each layer
+        timer = time()
+        layer2class2clusterer = dict()
+        for layer in layers:
+            class2values = dict()  # mapping: class_index -> values from watched layer
+            values = layer2values[layer]
+            for j, yj in enumerate(data.ground_truths()):
+                vj = values[j]
+                if yj in class2values:
+                    class2values[yj].append(vj)
+                else:
+                    class2values[yj] = [vj]
+
+            # find number of clusters
+            print("Layer {:d}:".format(layer))
+            class2clusters = cluster_refinement(class2values, algorithm=self.clustering_algorithm,
+                                                threshold=self.clustering_threshold, n_clusters=self.n_clusters)
+            layer2class2clusterer[layer] = class2clusters
+
+            # update abstraction with number of clusters
+            for monitor in self._monitors:  # type: Monitor
+                if includes_test_data != monitor.is_test_training_active():
+                    continue
+                monitor.update_clustering(layer, class2clusters)
+
+        statistics.time_training_monitor_clustering = time() - timer
+        return layer2class2clusterer
+
+    def _train_monitors(self, data, layer2values, layer2class2clusterer, predictions, statistics, includes_test_data):
+        timer = time()
+        ground_truths = data.ground_truths()
+        novelty_training_mode = layer2class2clusterer is None
+        for monitor in self._monitors:  # type: Monitor
+            if (novelty_training_mode and not monitor.is_novelty_training_active()) or \
+                    (includes_test_data != monitor.is_test_training_active()):
+                continue
+            print("training monitor {:d}{}".format(monitor.id(),
+                                                   " with novelties" if layer2class2clusterer is None else ""))
+            timer_monitor = time()
+            if novelty_training_mode:
+                monitor.train_with_novelties(predictions, layer2values)
+            else:
+                monitor.add_clustered(layer2values, ground_truths, layer2class2clusterer)
+            duration = time() - timer_monitor
+            if monitor.id() in statistics.time_tweaking_each_monitor.keys():
+                statistics.time_tweaking_each_monitor[monitor.id()] += duration
+            else:
+                statistics.time_tweaking_each_monitor[monitor.id()] = duration
+        duration = time() - timer
+        if statistics.time_training_monitor_tweaking == -1:
+            statistics.time_training_monitor_tweaking = duration
+        else:
+            statistics.time_training_monitor_tweaking += duration
+
+    def _determine_zero_filters(self, layer2values: dict, model: Model, data: DataSpec):
+        for layer, values in layer2values.items():
+            n_neurons = model.layers[layer].output_shape[1]
+            self.layer2class2nonzero_mask[layer] = determine_zero_filters(values, data, n_neurons, layer)
+
+    def _remove_zero_dimensions(self, layer2values, classes, compute_violation_indices: bool):
+        layer2values_new = dict()
+        zero_indices = set()
+        for layer, values in layer2values.items():
+            class2nonzero_indices = self.layer2class2nonzero_mask[layer]
+            filtered_values = []
+            layer2values_new[layer] = filtered_values
+            for j, (class_id, vj) in enumerate(zip(classes, values)):
+                vj_filtered = []
+                for vi, filter_i in zip(vj, class2nonzero_indices[class_id]):
+                    if filter_i:
+                        vj_filtered.append(vi)
+                    elif vi != 0:
+                        # found a violation
+                        zero_indices.add(j)
+                filtered_values.append(vj_filtered)
+        if compute_violation_indices:
+            return layer2values_new, sorted(zero_indices)
+        else:
+            return layer2values_new
+
+    def _combine_layer2values(self, layer2values_1: dict, layer2values_2: dict):
+        res = dict()
+        for k, v in layer2values_1.items():
+            res[k] = np.append(v, layer2values_2[k], axis=0)
+        return res
+
+
+    def _compute_alpha_thresholding(self, monitor_results: list, model, data: DataSpec):
+        confidences_at = model.predict_proba(data.x())
+        for monitor_result, prediction_model, confidence_at_vec in zip(monitor_results, confidences_at):
+            monitor_result.add_confidence(np.max(confidence_at_vec))
+
+##### FILE: C:\work\original\monitoring\MonitorManagerResult.py #####
+
+class MonitorManagerResult(object):
+    def __init__(self, monitor2results, confidences):
+        self.monitor2results = monitor2results
+        self.confidences = confidences
+
+##### FILE: C:\work\original\monitoring\Scores.py #####
+
+from utils import Statistics, MONITOR_TRAINING_CONVERGENCE_RANGE
+
+
+class Score(object):
+    def evaluate(self, stats):
+        pass
+
+    def isbetter(self, score1, score2):
+        return score1 > score2  # default: bigger is better
+
+    def name(self):
+        return ""
+
+    def termination(self, score_new, score_old):
+        return not self.isbetter(score_new, score_old) and\
+               abs(score_new - score_old < MONITOR_TRAINING_CONVERGENCE_RANGE)
+
+
+class F1Score(Score):
+    def evaluate(self, stats: Statistics):
+        return stats.f1_score()
+
+    def name(self):
+        return "F1 score"
+
+
+class AverageScore(Score):
+    def evaluate(self, stats: Statistics):
+        return stats.average_score()
+
+    def name(self):
+        return "AVG score"
+
+##### FILE: C:\work\original\monitoring\ThresholdAlpha.py #####
+
+from utils import *
+from data import *
+from trainers import *
+from monitoring import *
+
+
+def test_alpha(model, data, history, alpha):
+    n = float(number_of_model_classes(model))
+    b = n / (n - 1)
+    a = -b
+    confidences = model.predict_proba(data.x())
+    predictions = [np.argmax(x) for x in confidences]
+    history.set_ground_truths(data.ground_truths())
+    history.set_predictions(predictions)
+    results = []
+    for c_prediction, confidence_vector in zip(predictions, confidences):
+        result = MonitorResult()
+        # map range [1/n, 1] (possible probabilities of chosen class) to range [100, 0] (confidence range)
+        # we use a linear function ax + b with a, b defined above
+        confidence = a * confidence_vector[c_prediction] + b
+        result.add_confidence(confidence)
+        results.append(result)
+    history.set_monitor_results(0, results)
+    history.update_statistics(0, confidence_threshold=alpha)
+
+
+def run_script():
+    # options
+    alpha = .99
+    classes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    data_name = "F_MNIST"
+    data_train_model = DataSpec(classes=classes)
+    data_test_model = DataSpec(classes=classes)
+    data_train_monitor = DataSpec(classes=classes)
+    data_test_monitor = DataSpec(classes=classes)
+    data_run = DataSpec(randomize=False, classes=[x for x in range(0, 10)])
+    model_name = "F_MNIST"
+    model_path = "F_MNIST_MNIST_10-model.h5"
+    n_epochs = 0
+    batch_size = 128
+    labels_network, labels_rest = get_data_loader(data_name)(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run)
+
+    model_trainer = StandardTrainer()
+    statistics = Statistics()
+
+    model, history_model = get_model(model_name=model_name, data_train=data_train_model, data_test=data_test_model,
+                                     n_classes=len(labels_network), model_trainer=model_trainer, n_epochs=n_epochs,
+                                     batch_size=batch_size, statistics=statistics, model_path=model_path)
+    history = History()
+
+    test_alpha(model, data_run, history, alpha)
+
+    # plot statistics after timers
+    tn = history.true_negatives()
+    tp = history.true_positives()
+    fn = history.false_negatives()
+    fp = history.false_positives()
+    fig, ax = initialize_single_plot("Performance of threshold test confidence >= {:f}".format(alpha))
+    plot_pie_chart_single(ax=ax, tp=tp, tn=tn, fp=fp, fn=fn, n_run=data_run.n)
+    plt.show()
+
+
+if __name__ == "__main__":
+    run_script()
+
+##### FILE: C:\work\original\monitoring\__init__.py #####
+
+from .Scores import *
+
+from .MonitorManagerResult import MonitorManagerResult
+
+from .MonitorManager import MonitorManager
+from .Monitor import Monitor
+
+from .ThresholdAlpha import test_alpha
+
+from .EvaluateCombination import evaluate_combination, evaluate_all
+
+##### FILE: C:\work\original\data\CIFAR10.py #####
+
+import numpy as np
+from os import listdir
+import pickle
+from pickle import load, dump
+import tensorflow_core
+from tensorflow_core.python.keras.models import Model
+from tensorflow_core.python.keras.applications.resnet import preprocess_input
+from utils import DataSpec, load_data, filter_labels
+
+
+def load_CIFAR_10(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+                  data_test_monitor: DataSpec, data_run: DataSpec):
+    # raise(NotImplementedError("This method was abandoned. Please fix it first before using it."))
+
+    cifar10_dataset_folder_path = "../data/cifar-10-python/cifar-10-batches-py"
+    # preprocess_and_save_data(cifar10_dataset_folder_path, normalize, one_hot_encode)
+    n_batches = 5
+    x_train = []
+    y_train = []
+    for batch_i in range(1, n_batches + 1):
+        features, labels = load_cfar10_batch(cifar10_dataset_folder_path, batch_i)
+        x_train.extend(features)
+        y_train.extend(labels)
+    x_train = np.array(x_train)
+    y_train = np.array(y_train)
+    data_train_model.set_data(x=x_train, y=y_train)
+    data_train_monitor.set_data(x=x_train, y=y_train)
+    with open(cifar10_dataset_folder_path + "/test_batch", mode='rb') as file:
+        test = pickle.load(file, encoding='latin1')
+    x_test = np.array(test['data'].reshape((len(test['data']), 3, 32, 32)).transpose(0, 2, 3, 1))
+    y_test = np.array(test['labels'])
+    data_test_model.set_data(x=x_test, y=y_test)
+    data_test_monitor.set_data(x=x_test, y=y_test)
+    data_run.set_data(x=x_test, y=y_test)
+    pixel_depth = 255.0
+    all_classes_network, all_classes_rest = load_data(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run, pixel_depth=pixel_depth)
+    # labels
+    labels_all = ['label' + str(i) for i in range(10)]
+
+    labels_network = filter_labels(labels_all, all_classes_network)
+    labels_rest = filter_labels(labels_all, all_classes_rest)
+
+    return all_classes_network, labels_network, all_classes_rest, labels_rest
+
+
+def load_cfar10_batch(cifar10_dataset_folder_path, batch_id):
+    with open(cifar10_dataset_folder_path + "/data_batch_" + str(batch_id), mode='rb') as file:
+        # note the encoding type is 'latin1'
+        batch = load(file, encoding='latin1')
+
+    features = batch['data'].reshape((len(batch['data']), 3, 32, 32)).transpose(0, 2, 3, 1)
+    labels = batch['labels']
+    return features, labels
+
+
+def load_label_names():
+    return ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+
+def normalize(x):
+    """
+        argument
+            - x: input image data in numpy array [32, 32, 3]
+        return
+            - normalized x
+    """
+    min_val = np.min(x)
+    max_val = np.max(x)
+    x = (x-min_val) / (max_val-min_val)
+    return x
+
+
+def one_hot_encode(x):
+    """
+        argument
+            - x: a list of labels
+        return
+            - one hot encoding matrix (number of labels, number of class)
+    """
+    encoded = np.zeros((len(x), 10))
+
+    for idx, val in enumerate(x):
+        encoded[idx][val] = 1
+
+    return encoded
+
+
+def _preprocess_and_save(normalize, one_hot_encode, features, labels, filename):
+    features = normalize(features)
+    labels = one_hot_encode(labels)
+
+    dump((features, labels), open(filename, 'wb'))
+
+
+def preprocess_and_save_data(cifar10_dataset_folder_path, normalize, one_hot_encode):
+    n_batches = 5
+    valid_features = []
+    valid_labels = []
+
+    for batch_i in range(1, n_batches + 1):
+        features, labels = load_cfar10_batch(cifar10_dataset_folder_path, batch_i)
+
+        # find index to be the point as validation data in the whole dataset of the batch (10%)
+        index_of_validation = int(len(features) * 0.1)
+
+        # preprocess the 90% of the whole dataset of the batch
+        # - normalize the features
+        # - one_hot_encode the lables
+        # - save in a new file named, "preprocess_batch_" + batch_number
+        # - each file for each batch
+        _preprocess_and_save(normalize, one_hot_encode,
+                             features[:-index_of_validation], labels[:-index_of_validation],
+                             'preprocess_batch_' + str(batch_i) + '.p')
+
+        # unlike the training dataset, validation dataset will be added through all batch dataset
+        # - take 10% of the whold dataset of the batch
+        # - add them into a list of
+        #   - valid_features
+        #   - valid_labels
+        valid_features.extend(features[-index_of_validation:])
+        valid_labels.extend(labels[-index_of_validation:])
+
+    # preprocess the all stacked validation dataset
+    _preprocess_and_save(normalize, one_hot_encode,
+                         np.array(valid_features), np.array(valid_labels),
+                         'preprocess_validation.p')
+
+    # load the test dataset
+    with open(cifar10_dataset_folder_path + "/test_batch", mode='rb') as file:
+        batch = load(file, encoding='latin1')
+
+    # preprocess the testing data
+    test_features = batch['data'].reshape((len(batch['data']), 3, 32, 32)).transpose(0, 2, 3, 1)
+    test_labels = batch['labels']
+
+    # Preprocess and Save all testing data
+    _preprocess_and_save(normalize, one_hot_encode,
+                         np.array(test_features), np.array(test_labels),
+                         "preprocess_testing.p")
+
+
+# extract features from each photo in the directory
+def extract_features(data_path):
+    model = network()
+    model.layers.pop()
+    model = Model(inputs=model.inputs, outputs=model.layers[-1].output)
+    print(model.summary())
+    features = dict()
+    for name in listdir(data_path):
+        filename = data_path + "/" + name
+        image1 = name.split(".")
+        image_id = image1[0]
+        if not image1[1] == 'jpg':
+            continue
+        image = tensorflow_core.python.keras.preprocessing.image.load_img(filename, target_size=(224, 224))
+        image = tensorflow_core.python.keras.preprocessing.image.img_to_array(image)  # this is (224, 224, 3)
+        image = image.reshape(1, image.shape[0], image.shape[1], image.shape[2])  # this is (1, 224, 224, 3)
+        image = preprocess_input(image)
+        feature = model.predict(image)
+        features[image_id] = feature
+        print(">%s" % name)
+    return features
+
+##### FILE: C:\work\original\data\DataLoader.py #####
+
+from . import *
+
+
+def get_data_loader(string):
+    if string == "GTSRB":
+        return load_GTSRB
+    elif string == "CIFAR10":
+        return load_CIFAR_10
+    elif string == "MNIST":
+        return load_MNIST
+    elif string == "F_MNIST":
+        return load_F_MNIST
+    elif string == "ToyData":
+        return load_ToyData
+    else:
+        raise(ValueError("Could not find data " + string + "!"))
+
+##### FILE: C:\work\original\data\F_MNIST.py #####
+
+import numpy as np
+import tensorflow as tf
+from utils import DataSpec, load_data, filter_labels
+import pickle
+import gzip
+import os
+import struct
+
+try:
+    from urllib.request import urlretrieve
+except ImportError:
+    from urllib import urlretrieve
+
+DOWNLOAD = False
+
+
+def load_F_MNIST(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+               data_test_monitor: DataSpec, data_run: DataSpec):
+    # raise(NotImplementedError("This method was abandoned. Please fix it first before using it."))
+
+    # URLs for the train image and label data
+    url_train_image = 'train-images-idx3-ubyte.gz'
+    url_train_labels = 'train-labels-idx1-ubyte.gz'
+    num_train_samples = 60000
+
+    # print("Downloading train data")
+    # train = try_download(url_train_image, url_train_labels, num_train_samples)
+
+    # URLs for the test image and label data
+    url_test_image = 't10k-images-idx3-ubyte.gz'
+    url_test_labels = 't10k-labels-idx1-ubyte.gz'
+    num_test_samples = 10000
+
+    # print("Downloading test data")
+    # test = try_download(url_test_image, url_test_labels, num_test_samples)
+
+    """
+    # (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    # Reshaping the array to 4-dims so that it can work with the Keras API
+    x_train = x_train.reshape(x_train.shape[0], 28, 28, 1)
+    x_test = x_test.reshape(x_test.shape[0], 28, 28, 1)
+    # Making sure that the values are float so that we can get decimal points after division
+    x_train = x_train.astype('float32')
+    x_test = x_test.astype('float32')
+    # Normalizing the RGB codes by dividing it to the max RGB value.
+    x_train /= 255
+    x_test /= 255
+
+    x_train = np.array(x_train)
+    y_train = np.array(y_train)
+    x_test = np.array(x_test)
+    y_test = np.array(y_test)
+    """
+
+    x_train = loadData(url_train_image, num_train_samples)
+    y_train = loadLabels(url_train_labels, num_train_samples)
+
+    x_test = loadData(url_test_image, num_test_samples)
+    y_test = loadLabels(url_test_labels, num_test_samples)
+
+    # Reshaping the array to 4-dims so that it can work with the Keras API
+    x_train = x_train.reshape(x_train.shape[0], 28, 28, 1)
+    x_test = x_test.reshape(x_test.shape[0], 28, 28, 1)
+
+    data_train_model.set_data(x=x_train, y=y_train)
+    data_train_monitor.set_data(x=x_train, y=y_train)
+    data_test_model.set_data(x=x_test, y=y_test)
+    data_test_monitor.set_data(x=x_test, y=y_test)
+    data_run.set_data(x=x_test, y=y_test)
+    pixel_depth = 255.0
+    all_classes_network, all_classes_rest = load_data(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run, pixel_depth=pixel_depth)
+    # labels
+    labels_all = ['label' + str(i) for i in range(10)]
+
+    labels_network = filter_labels(labels_all, all_classes_network)
+    labels_rest = filter_labels(labels_all, all_classes_rest)
+
+    return all_classes_network, labels_network, all_classes_rest, labels_rest
+
+
+# Functions to load MNIST images and unpack into train and test set.
+# - loadData reads a image and formats it into a 28x28 long array
+# - loadLabels reads the corresponding label data, one for each image
+# - load packs the downloaded image and label data into a combined format to be read later by
+#   the CNTK text reader
+
+
+def loadData(src, cimg):
+    gzfname = "../data/Fashion_MNIST/{}".format(src)
+
+    try:
+        with gzip.open(gzfname) as gz:
+            n = struct.unpack('I', gz.read(4))
+            # Read magic number.
+            if n[0] != 0x3080000:
+                raise Exception('Invalid file: unexpected magic number.')
+            # Read number of entries.
+            n = struct.unpack('>I', gz.read(4))[0]
+            if n != cimg:
+                raise Exception('Invalid file: expected {0} entries.'.format(cimg))
+            crow = struct.unpack('>I', gz.read(4))[0]
+            ccol = struct.unpack('>I', gz.read(4))[0]
+            if crow != 28 or ccol != 28:
+                raise Exception('Invalid file: expected 28 rows/cols per image.')
+            # Read data.
+            res = np.fromstring(gz.read(cimg * crow * ccol), dtype=np.uint8)
+    finally:
+        if DOWNLOAD:
+            os.remove(gzfname)
+    return res.reshape((cimg, crow, ccol))
+
+
+def loadLabels(src, cimg):
+    gzfname = "../data/Fashion_MNIST/{}".format(src)
+    try:
+        with gzip.open(gzfname) as gz:
+            n = struct.unpack('I', gz.read(4))
+            # Read magic number.
+            if n[0] != 0x1080000:
+                raise Exception('Invalid file: unexpected magic number.')
+            # Read number of entries.
+            n = struct.unpack('>I', gz.read(4))
+            if n[0] != cimg:
+                raise Exception('Invalid file: expected {0} rows.'.format(cimg))
+            # Read labels.
+            res = np.fromstring(gz.read(cimg), dtype=np.uint8)
+    finally:
+        if DOWNLOAD:
+            os.remove(gzfname)
+    return res.reshape((cimg,))
+
+
+def try_download(dataSrc, labelsSrc, cimg):
+    data = loadData(dataSrc, cimg)
+    labels = loadLabels(labelsSrc, cimg)
+    return np.hstack((data, labels))
+
+
+##### FILE: C:\work\original\data\GTSRB.py #####
+
+from utils import DataSpec, load_data, filter_labels
+
+
+def load_GTSRB(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+               data_test_monitor: DataSpec, data_run: DataSpec):
+    # names of the data files
+    data_train_model.file = "data/GTSRB/train.p"
+    data_test_model.file = "data/GTSRB/test.p"
+    data_train_monitor.file = data_train_model.file  # use training data for training
+    data_test_monitor.file = data_test_model.file  # use testing data for running
+    data_run.file = data_test_model.file  # use testing data for running
+
+    pixel_depth = 255.0
+
+    all_classes_network, all_classes_rest = load_data(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run, pixel_depth=pixel_depth)
+
+    # labels
+    labels_all = ['label' + str(i) for i in range(43)]  # dummy names, TODO add correct names
+    labels_all[0] = "20 km/h"
+    labels_all[1] = "30 km/h"
+    labels_all[2] = "50 km/h"
+    labels_all[10] = "no passing"
+
+    labels_network = filter_labels(labels_all, all_classes_network)
+    labels_rest = filter_labels(labels_all, all_classes_rest)
+
+    return all_classes_network, labels_network, all_classes_rest, labels_rest
+
+##### FILE: C:\work\original\data\MNIST.py #####
+
+import numpy as np
+import tensorflow as tf
+from utils import DataSpec, load_data, filter_labels
+import pickle
+import gzip
+import os
+import struct
+
+try:
+    from urllib.request import urlretrieve
+except ImportError:
+    from urllib import urlretrieve
+
+DOWNLOAD = False
+
+
+def load_MNIST(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+               data_test_monitor: DataSpec, data_run: DataSpec):
+    # raise(NotImplementedError("This method was abandoned. Please fix it first before using it."))
+
+    # URLs for the train image and label data
+    url_train_image = 'train-images-idx3-ubyte.gz'
+    url_train_labels = 'train-labels-idx1-ubyte.gz'
+    num_train_samples = 60000
+
+    # print("Downloading train data")
+    # train = try_download(url_train_image, url_train_labels, num_train_samples)
+
+    # URLs for the test image and label data
+    url_test_image = 't10k-images-idx3-ubyte.gz'
+    url_test_labels = 't10k-labels-idx1-ubyte.gz'
+    num_test_samples = 10000
+
+    # print("Downloading test data")
+    # test = try_download(url_test_image, url_test_labels, num_test_samples)
+
+    """
+    # (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    # Reshaping the array to 4-dims so that it can work with the Keras API
+    x_train = x_train.reshape(x_train.shape[0], 28, 28, 1)
+    x_test = x_test.reshape(x_test.shape[0], 28, 28, 1)
+    # Making sure that the values are float so that we can get decimal points after division
+    x_train = x_train.astype('float32')
+    x_test = x_test.astype('float32')
+    # Normalizing the RGB codes by dividing it to the max RGB value.
+    x_train /= 255
+    x_test /= 255
+
+    x_train = np.array(x_train)
+    y_train = np.array(y_train)
+    x_test = np.array(x_test)
+    y_test = np.array(y_test)
+    """
+
+    x_train = loadData(url_train_image, num_train_samples)
+    y_train = loadLabels(url_train_labels, num_train_samples)
+
+    x_test = loadData(url_test_image, num_test_samples)
+    y_test = loadLabels(url_test_labels, num_test_samples)
+
+    # Reshaping the array to 4-dims so that it can work with the Keras API
+    x_train = x_train.reshape(x_train.shape[0], 28, 28, 1)
+    x_test = x_test.reshape(x_test.shape[0], 28, 28, 1)
+
+    data_train_model.set_data(x=x_train, y=y_train)
+    data_train_monitor.set_data(x=x_train, y=y_train)
+    data_test_model.set_data(x=x_test, y=y_test)
+    data_test_monitor.set_data(x=x_test, y=y_test)
+    data_run.set_data(x=x_test, y=y_test)
+    pixel_depth = 255.0
+    all_classes_network, all_classes_rest = load_data(
+        data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+        data_test_monitor=data_test_monitor, data_run=data_run, pixel_depth=pixel_depth)
+    # labels
+    labels_all = ['label' + str(i) for i in range(10)]
+
+    labels_network = filter_labels(labels_all, all_classes_network)
+    labels_rest = filter_labels(labels_all, all_classes_rest)
+
+    return all_classes_network, labels_network, all_classes_rest, labels_rest
+
+
+# Functions to load MNIST images and unpack into train and test set.
+# - loadData reads a image and formats it into a 28x28 long array
+# - loadLabels reads the corresponding label data, one for each image
+# - load packs the downloaded image and label data into a combined format to be read later by
+#   the CNTK text reader
+
+
+def loadData(src, cimg):
+    if DOWNLOAD:
+        src = "http://yann.lecun.com/exdb/mnist/" + src
+        print('Downloading ' + src)
+        gzfname, h = urlretrieve(src, './delete.me')
+        print('Done.')
+    else:
+        gzfname = "../data/MNIST/{}".format(src)
+
+    try:
+        with gzip.open(gzfname) as gz:
+            n = struct.unpack('I', gz.read(4))
+            # Read magic number.
+            if n[0] != 0x3080000:
+                raise Exception('Invalid file: unexpected magic number.')
+            # Read number of entries.
+            n = struct.unpack('>I', gz.read(4))[0]
+            if n != cimg:
+                raise Exception('Invalid file: expected {0} entries.'.format(cimg))
+            crow = struct.unpack('>I', gz.read(4))[0]
+            ccol = struct.unpack('>I', gz.read(4))[0]
+            if crow != 28 or ccol != 28:
+                raise Exception('Invalid file: expected 28 rows/cols per image.')
+            # Read data.
+            res = np.fromstring(gz.read(cimg * crow * ccol), dtype=np.uint8)
+    finally:
+        if DOWNLOAD:
+            os.remove(gzfname)
+    return res.reshape((cimg, crow, ccol))
+
+
+def loadLabels(src, cimg):
+    if DOWNLOAD:
+        src = "http://yann.lecun.com/exdb/mnist/" + src
+        print('Downloading ' + src)
+        gzfname, h = urlretrieve(src, './delete.me')
+        print('Done.')
+    else:
+        gzfname = "../data/MNIST/{}".format(src)
+    try:
+        with gzip.open(gzfname) as gz:
+            n = struct.unpack('I', gz.read(4))
+            # Read magic number.
+            if n[0] != 0x1080000:
+                raise Exception('Invalid file: unexpected magic number.')
+            # Read number of entries.
+            n = struct.unpack('>I', gz.read(4))
+            if n[0] != cimg:
+                raise Exception('Invalid file: expected {0} rows.'.format(cimg))
+            # Read labels.
+            res = np.fromstring(gz.read(cimg), dtype=np.uint8)
+    finally:
+        if DOWNLOAD:
+            os.remove(gzfname)
+    return res.reshape((cimg,))
+
+
+def try_download(dataSrc, labelsSrc, cimg):
+    data = loadData(dataSrc, cimg)
+    labels = loadLabels(labelsSrc, cimg)
+    return np.hstack((data, labels))
+
+
+##### FILE: C:\work\original\data\ToyData.py #####
+
+import numpy as np
+
+from utils import DataSpec, load_data
+
+
+def load_ToyData(data_train_model: DataSpec, data_test_model: DataSpec, data_train_monitor: DataSpec,
+                 data_test_monitor: DataSpec, data_run: DataSpec):
+    # add data
+    x = np.array([[0.7, 0.2], [0.6, 0.2], [0.7, 0.1], [0.8, 0.1],  # class 1, first cluster
+                  [0.9, 0.2],  # class 1, second cluster
+                  [0.5, 0.5], [0.5, 0.6], [0.4, 0.6],  # class 2, first cluster
+                  [0.2, 0.7]  # class 2, second cluster
+                  ])
+    y = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1])
+    data_train_model.set_data(x=x, y=y)
+    data_test_model.set_data(x=x, y=y)
+    data_train_monitor.set_data(x=x, y=y)
+    data_test_monitor.set_data(x=x, y=y)
+    data_run.set_data(x=x, y=y)
+
+    pixel_depth = None
+
+    load_data(data_train_model=data_train_model, data_test_model=data_test_model, data_train_monitor=data_train_monitor,
+              data_test_monitor=data_test_monitor, data_run=data_run, pixel_depth=pixel_depth)
+
+    # labels
+    all_classes_network = [0, 1]
+    labels_network = ["label1", "label2"]
+    all_classes_rest = all_classes_network
+    labels_rest = labels_network
+
+    return all_classes_network, labels_network, all_classes_rest, labels_rest
+
+##### FILE: C:\work\original\data\__init__.py #####
+
+from .GTSRB import *
+from .CIFAR10 import *
+from .MNIST import *
+from .F_MNIST import *
+from .ToyData import *
+
+from .DataLoader import get_data_loader
