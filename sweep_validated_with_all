@@ -1,0 +1,244 @@
+import csv
+import time
+import numpy as np
+
+from model import MNISTCNY19
+from compare_with_baseline import load_keras_weights
+from run_baseline import load, extract, take, stats, LAYERS, DEVICE, seed_all
+from monitor_rotated import MultiLayerMonitor, RotatedBox
+from rff import RFF
+
+MODELS_DIR = r"C:\work\original\models"
+THRESHOLD = 0.07                       # same as all earlier experiments
+FIT_EPS = 0.0                          # same as before (only adaptive_validation uses it while fitting)
+
+# =====================================================================
+# 1. CHOOSE THE EXPERIMENT HERE (change only this line)
+# =====================================================================
+PRESET = "tune_sigma"
+#   "quick_test" : 1 seed, n=3, all methods, ALL epsilons (check for typos first)
+#   "tune_sigma" : picks sigma_scale WITHOUT touching the test set
+#   "final"      : all seeds, all n, all methods, ALL epsilons, one fixed sigma
+
+# Sigma scale used by quick_test and final, one value per RFF method.
+# Fill these in from the tune_sigma result BEFORE running "final", then do not change them.
+RFF_SIGMA = {"rff_d4": 2.0, "rff_rot_d1": 2.0, "rff_rot_d2": 2.0}
+
+ALL = ["box", "rotated", "adaptive_validation",
+       "rff_d4",                      # RFF + plain Box
+       "rff_rot_d1", "rff_rot_d2"]    # RFF + rotated box (d1, d2 = low dimension)
+
+PRESETS = {
+    "quick_test": dict(seeds=[0], n_range=[3], run=ALL, sigmas=None,      # sigmas=None -> use RFF_SIGMA
+                       use_test=True, out="results_quick_test_v2.csv"),
+    "tune_sigma": dict(seeds=[0], n_range=[3, 6, 9],
+                       run=["box", "rotated", "rff_d4", "rff_rot_d1", "rff_rot_d2"],
+                       sigmas=[0.5, 1.0, 2.0, 4.0],
+                       use_test=False, out="results_tune_sigma.csv"),
+    "final":      dict(seeds=[0, 1, 2], n_range=list(range(2, 10)), run=ALL, sigmas=None,   # use RFF_SIGMA
+                       use_test=True, out="results_final_v2.csv"),
+}
+
+cfg = PRESETS[PRESET]
+SEEDS, N_RANGE, RUN = cfg["seeds"], cfg["n_range"], cfg["run"]
+SIGMAS, USE_TEST, OUT_FILE = cfg["sigmas"], cfg["use_test"], cfg["out"]
+
+# =====================================================================
+# 2. SELECTION SETTINGS
+#    Every epsilon is evaluated and saved. The one marked selected=True is chosen
+#    WITHOUT the test set (validation on held-out known training points).
+#    Do not pick the "best" epsilon or sigma by looking at the test columns.
+# =====================================================================
+VAL_FRAC = 0.2                         # 20% of the correctly classified known training points are held out
+TARGET_FW = 0.05                       # selected epsilon = smallest one whose validation FW <= 5%
+EPSILONS = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5]
+NOV_VAL_MAX = 3000                     # tune_sigma only: unseen-digit TRAINING images used as validation novelty
+
+# =====================================================================
+# 3. SHAPE POLICIES AND RFF SETTINGS (layer -1 stays a plain Box in every method)
+# =====================================================================
+ROT_LAYERS = [-2, -3, -4]
+RFF_LAYERS = [-2, -3, -4]
+RFF_D_MAX = 800                        # safety cap on D (not reached here: the largest D is 4 x 160 = 640)
+RFF_FACTORS = {"rff_d4": 4, "rff_rot_d1": 1, "rff_rot_d2": 2}   # D = factor * layer dim
+
+ROT = {l: RotatedBox for l in ROT_LAYERS}
+SHAPES = {
+    "box": None,
+    "rotated": ROT,
+    "adaptive_validation": {l: "adaptive_validation" for l in ROT_LAYERS},
+    "rff_d4": None,                              # RFF + plain Box
+    "rff_rot_d1": ROT, "rff_rot_d2": ROT,        # RFF + rotated box
+}
+
+
+def apply_rff(V_fit, sets, seed, factor, sigma_scale):
+    """One RFF map per layer, fitted on the FIT part only, then applied to the fit part
+    and to every other set (validation / test / novelty-validation) with the SAME map."""
+    Vf, out, dims = dict(V_fit), {k: dict(v) for k, v in sets.items()}, {}
+    for l in RFF_LAYERS:
+        D = int(min(factor * V_fit[l].shape[1], RFF_D_MAX))
+        f = RFF(D, sigma_scale, seed=seed * 100 + abs(l)).fit(V_fit[l])
+        Vf[l] = f.transform(V_fit[l])
+        for k in out:
+            out[k][l] = f.transform(sets[k][l])
+        dims[l] = D
+    return Vf, out, dims
+
+
+def test_rates(r):
+    return (100 * r["nov_det"] / (r["nov_det"] + r["nov_undet"]),
+            100 * r["fp"] / (r["fp"] + r["tn"]))
+
+
+def print_table(rs):
+    """Validation-selected epsilon only: one line per method (mean over the rows given)."""
+    cols = f"{'method':22s}{'eps':>6s}{'valFW%':>8s}"
+    cols += f"{'det%':>8s}{'FW%':>8s}" if USE_TEST else f"{'valdet%':>9s}"
+    print(cols + f"{'clusters':>10s}{'fit_s':>8s}")
+    for label in dict.fromkeys(r["method"] for r in rs):
+        g = [r for r in rs if r["method"] == label]
+        line = f"{label:22s}{np.mean([r['epsilon'] for r in g]):6.2f}{np.mean([r['val_fw_pct'] for r in g]):8.1f}"
+        if USE_TEST:
+            t = np.array([test_rates(r) for r in g])
+            line += f"{t[:, 0].mean():8.1f}{t[:, 1].mean():8.1f}"
+        else:
+            line += f"{np.mean([r['val_det_pct'] for r in g]):9.1f}"
+        print(line + f"{np.mean([r['n_clusters'] for r in g]):10.1f}{np.mean([r['fit_s'] for r in g]):8.1f}")
+
+
+def print_grid(rs):
+    """All epsilons: one line per method, one cell per epsilon = detected% / false-warning%."""
+    print(f"{'method':22s}" + "".join(f"{'eps=' + str(e):>13s}" for e in EPSILONS))
+    for label in dict.fromkeys(r["method"] for r in rs):
+        line = f"{label:22s}"
+        for e in EPSILONS:
+            g = [r for r in rs if r["method"] == label and r["epsilon"] == e]
+            if USE_TEST:
+                t = np.array([test_rates(r) for r in g]); a, b = t[:, 0].mean(), t[:, 1].mean()
+            else:
+                a, b = np.mean([r["val_det_pct"] for r in g]), np.mean([r["val_fw_pct"] for r in g])
+            line += f"{a:6.1f}/{b:5.1f} "
+        print(line)
+
+
+def report(rs, title):
+    what = "test det% / test FW%" if USE_TEST else "val det% / val FW%"
+    print(f"\n--- {title}: epsilon selected on validation (mean over seeds) ---")
+    print_table([r for r in rs if r["selected"]])
+    print(f"\n--- {title}: ALL epsilons, cell = {what} (do not pick the best from here) ---")
+    print_grid(rs)
+
+
+def save():
+    with open(OUT_FILE, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader(); w.writerows(rows)
+
+
+# =====================================================================
+# 4. EXPERIMENT
+# =====================================================================
+print(f"PRESET = {PRESET} | test used: {USE_TEST} | methods = {RUN} | sigmas = {SIGMAS} | seeds = {SEEDS}")
+print(f"selected epsilon = smallest one with validation FW <= {100 * TARGET_FW:.0f}% (known held-out training points)")
+x_tr, y_tr, x_te, y_te = load()
+rows = []
+
+for n in N_RANGE:
+    model = MNISTCNY19(n)
+    load_keras_weights(model, rf"{MODELS_DIR}\CNY19id1_MNIST_0-{n-1}.h5")
+    model.to(DEVICE).eval()
+
+    tr = y_tr < n
+    V_tr = extract(model, x_tr[tr]); gt_tr = y_tr[tr]
+    ok = V_tr[-1].argmax(1) == gt_tr
+    V_ok, y_ok = take(V_tr, ok), gt_tr[ok]           # known, correctly classified training points
+
+    if USE_TEST:
+        te = y_te < n
+        V_run = extract(model, x_te)
+        pred = V_run[-1].argmax(1)                   # always from the RAW outputs
+        correct = pred == y_te
+        print(f"\nn={n}: accuracy on known digits = {correct[te].mean():.4f}")
+    else:
+        nov = np.where(y_tr >= n)[0]                 # unseen digits, but from the TRAINING set (not test)
+        nov = np.random.default_rng(123).choice(nov, min(NOV_VAL_MAX, len(nov)), replace=False)
+        V_nov = extract(model, x_tr[nov])
+        pred_nov = V_nov[-1].argmax(1)
+        print(f"\nn={n}: validation novelty = {len(nov)} unseen-digit training images")
+
+    for seed in SEEDS:
+        # same split for every method of this (n, seed)
+        is_val = np.zeros(len(y_ok), dtype=bool)
+        is_val[np.random.default_rng(seed).permutation(len(y_ok))[:int(VAL_FRAC * len(y_ok))]] = True
+        V_fit, y_fit = take(V_ok, ~is_val), y_ok[~is_val]
+        V_val, y_val = take(V_ok, is_val), y_ok[is_val]
+        sets = {"val": V_val}
+        sets["test" if USE_TEST else "nov"] = V_run if USE_TEST else V_nov
+
+        for name in RUN:
+            is_rff = name.startswith("rff")
+            for sig in ((SIGMAS or [RFF_SIGMA[name]]) if is_rff else [None]):
+                label = f"{name}_s{sig}" if is_rff else name
+                seed_all(seed)                       # identical k-means seed for every method
+                mon = MultiLayerMonitor(LAYERS, shape_by_layer=SHAPES[name],
+                                        threshold=THRESHOLD, epsilon=FIT_EPS)
+
+                t0 = time.perf_counter()
+                dims = {}
+                if is_rff:
+                    Vf, S, dims = apply_rff(V_fit, sets, seed, RFF_FACTORS[name], sig)
+                else:
+                    Vf, S = V_fit, sets
+                rff_s = time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                mon.fit(Vf, y_fit, n)                # fit ONCE per (n, seed, method)
+                fit_s = time.perf_counter() - t0
+
+                all_shapes = [s for m in mon.mons.values()
+                              for lst in m.shapes.values() for s in lst]
+                base = dict(seed=seed, n_classes=n, method=label,
+                            n_clusters=len(all_shapes),
+                            n_rotated=sum(isinstance(s, RotatedBox) for s in all_shapes),
+                            fit_s=round(fit_s, 3), rff_s=round(rff_s, 3),
+                            rff_sigma_scale=sig if is_rff else 0,
+                            rff_dims=";".join(f"{l}:{d}" for l, d in dims.items()))
+
+                mine, chosen = [], None
+                for eps in EPSILONS:                 # only re-evaluate per epsilon
+                    for m in mon.mons.values():
+                        m.epsilon = eps
+                    val_fw = 1 - mon.accepts(S["val"], y_val).mean()
+                    if chosen is None and val_fw <= TARGET_FW:
+                        chosen = eps                 # selection uses validation only
+                    row = dict(base, epsilon=eps, val_fw_pct=round(100 * val_fw, 2))
+                    if USE_TEST:
+                        acc = mon.accepts(S["test"], pred)
+                        row.update(stats(correct, acc, y_te, n))
+                    else:
+                        row["val_det_pct"] = round(100 * (1 - mon.accepts(S["nov"], pred_nov).mean()), 2)
+                    mine.append(row)
+                reached = chosen is not None
+                if not reached:
+                    chosen = EPSILONS[-1]
+                for r in mine:
+                    r["selected"] = (r["epsilon"] == chosen)
+                    r["target_reached"] = reached
+                rows.extend(mine)
+
+                s = next(r for r in mine if r["selected"])
+                if USE_TEST:
+                    det, fw = test_rates(s)
+                    result = f"test det {det:5.1f}%  FW {fw:4.1f}%"
+                else:
+                    result = f"val det {s['val_det_pct']:5.1f}%"
+                print(f"   n={n} seed={seed} {label:20s} selected eps={chosen:<4} valFW={s['val_fw_pct']:4.1f}% | "
+                      f"{result} | clusters {s['n_clusters']} | fit {fit_s:.0f}s"
+                      + ("" if reached else "  (target FW not reached)"))
+
+    report([r for r in rows if r["n_classes"] == n], f"n={n}")
+    save()                                           # saved after every n, so a long run is never lost
+
+report(rows, "OVERALL (all n, all seeds)")
+print("saved", OUT_FILE)
